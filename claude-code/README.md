@@ -10,6 +10,9 @@ Claude Code config shared between Windows and Android. Single source of truth.
 | `statusline-rs/` | Rust source for the compiled statusline (xhigh magenta halo + max rainbow stretch). **Requires SAC disabled** — see dedicated section. |
 | `settings.json` | Claude Code config (model, plugins, `.exe` statusline) |
 | `hooks/` | `auto-pull.ps1`, `auto-push.ps1`, `resolve-sync-conflicts.ps1` — reserved for manual/future use, no longer called from SessionStart/End |
+| `hooks/error-vault-trigger.ps1` | `UserPromptSubmit` hook: detects a correction/repetition phrase in the prompt and injects a reminder to consult the `error-vault` skill. Never blocks. |
+| `hooks/curfew.ps1` | `UserPromptSubmit` hook: warns (never refuses) on prompts around a time window read from a local, never-committed config; `#jedors` in a prompt buys a silent night. No config file → inert. See the Curfew section below. |
+| `hooks/tests/curfew.tests.ps1` | Dependency-free test suite for the curfew hook (`pwsh -NoProfile -File claude-code/hooks/tests/curfew.tests.ps1`). Subfolders of `hooks/` are not deployed by `deploy.ps1`, so tests stay in the repo. |
 | `skills/` | Custom skills: claude-file-recovery, copy-edit, css-layout-check, deploy-safety, humanizer, lucide-icons, root-cause-fix, smart-edit, sticky-column-bleed-fix, webapp-deploy |
 | `deploy.ps1` | Manual bidirectional sync between this folder and the **Windows** `~/.claude/` |
 | `keybindings.json` | Custom Claude Code keybindings: disables Claude Code's native `Alt+V` image paste on Windows so AutoHotkey can paste a local file path instead; also includes `Alt+L` -> `/login` fallback (see Login / Resume shortcuts below) |
@@ -214,6 +217,52 @@ ssh phone 'termux-reload-settings'
 ```
 
 Rollback: `ssh phone 'cp ~/.termux/font.ttf.bak ~/.termux/font.ttf && termux-reload-settings'`. Re-run the patch if a Termux font update overwrites it.
+
+## Curfew — warn about new prompts inside a time window
+
+`hooks/curfew.ps1` is a `UserPromptSubmit` hook that **warns** on prompts submitted around a time window you choose (e.g. "no new work between 23:00 and 05:00"). It never refuses anything: it exits 0 and prints a JSON payload whose `systemMessage` you see and whose `additionalContext` tells Claude to wrap up.
+
+Three regimes: **notice** (default 15 / 10 / 5 minutes before the window — calibrate the work to fit), **grace** (the first 10 minutes of the window — bring the current work to a stable point), and **overdue** (past the grace — stop now).
+
+**What it does not do, by design:** it is wired on `UserPromptSubmit` only — never `PreToolUse`, `Stop`, `SessionStart` or anything else that fires during a turn. A task started before the window continues to its real end; only the *next* prompt is warned about. At the window's end hour (exclusive), prompts go through silently again with no restart needed — the hook reads the wall clock on every prompt.
+
+**Night pass (`#jedors`)** — for a goal meant to run while you sleep. Put `#jedors` (case-insensitive) anywhere in the prompt that launches it: the hook writes `%USERPROFILE%\.claude\curfew.nuit.json` and then stays silent for **every** prompt until the window's `end` hour — loop iterations, background agents waking up, a prompt you type at 3 a.m. The exemption is deliberately global rather than per-session, since the session that says `#jedors` is not necessarily the one relaunched during the night. The marker expires on its own; deleting the file hands control back to the curfew immediately. An absent, unreadable or undated marker means a normal curfew (fail-open, like everything else here).
+
+**The hours are never committed.** The hook is generic; the schedule lives in a local file that `deploy.ps1` does not track, so it survives every `deploy.ps1 -Pull`:
+
+```powershell
+# %USERPROFILE%\.claude\curfew.local.json   (example values - use your own)
+{
+  "enabled": true,
+  "start": "01:00",
+  "end": "08:00"
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | Optional, defaults to `true`. `false` makes the hook inert without deleting the file. |
+| `start` | Start of the curfew, **inclusive**. `"HH:mm"` or a plain hour (`23`). |
+| `end` | End of the curfew, **exclusive**. Same formats. `end < start` simply means the window crosses midnight. Also the hour a `#jedors` night pass expires. |
+| `warnBefore` | Optional, defaults to `[15, 10, 5]`. Notice thresholds in minutes before `start`. Values outside `]0, 720]` are dropped; an empty or unreadable list falls back to the default. |
+| `graceAfter` | Optional, defaults to `10`. Minutes of grace after `start` (integer in `[0, 60]`). `0` means a hard stop from the first minute. |
+| `message` | Optional. Replaces the message shown to the user inside the window (grace **and** overdue). |
+
+Wire it in `settings.json` (already done in this repo's `settings.json`, alongside `error-vault-trigger.ps1`):
+
+```json
+"UserPromptSubmit": [
+  { "hooks": [
+      { "type": "command", "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$USERPROFILE/.claude/hooks/curfew.ps1\"", "timeout": 10 }
+  ] }
+]
+```
+
+**Fail-open by construction**: no config file, unreadable JSON, unparsable hours, `start == end`, a broken night marker, or any internal error → exit 0, no warning, prompt untouched. A broken curfew must never lock you out. This is also why cloning this repo without a `curfew.local.json` changes nothing for you.
+
+The hook reads the event payload on stdin (to spot `#jedors`), but **only when stdin is redirected** — run by hand in a terminal it returns at once instead of waiting on an input that will never come.
+
+Tests: `pwsh -NoProfile -File claude-code/hooks/tests/curfew.tests.ps1` (95 assertions, no Pester needed) — boundary hours, midnight wrap, notice thresholds, grace, night pass arming/expiry/cleanup, fail-open paths, and a check that no `curfew` hook is ever registered on an event that would interrupt an active task.
 
 ## Vision delegation (no-vision backends) + Alt+V screenshot shortcut
 

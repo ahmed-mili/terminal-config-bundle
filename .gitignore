@@ -40,3 +40,10 @@ docs/
 # Presse-papiers capture par le skill copy-edit : contenu arbitraire,
 # jamais versionne (une copie peut contenir n'importe quoi de personnel).
 claude-code/skills/copy-edit/temp_clip.txt
+
+# Couvre-feu : horaires personnels, jamais versionnes (repo public).
+curfew.local.json
+
+# Marqueur de nuit blanche (#jedors) : etat local d'une nuit, ecrit par le
+# hook dans ~/.claude/, sans rien a faire dans le repo.
+curfew.nuit.json
