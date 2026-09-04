@@ -1390,8 +1390,6 @@ const SYNC_FRESH: (u8, u8, u8) = (217, 179, 130);
 /// frais (visiblement terni) et de 22 dE avec AGENTS_FG, qui portait exactement
 /// la meme valeur avant : deux signaux sans rapport ne doivent pas se confondre.
 const SYNC_FADED: (u8, u8, u8) = (201, 177, 142);
-/// Accent de l'UI /usage extrait de claude.exe, reserve au chevron final sans texte.
-const BANNER_EXIT: (u8, u8, u8) = (218, 119, 86);
 /// Rust sombre obtenu en assombrissant l'argile Claude pour le mode bypassPermissions.
 const MODE_BYPASS_BG: (u8, u8, u8) = (110, 48, 40);
 /// Ardoise chaude obtenue en teintant les neutres Claude pour le mode plan.
@@ -1682,9 +1680,11 @@ fn build_line1(
     }
     line1.push(' ');
 
-    // Chevron final
+    // Chevron final : il prolonge le bloc modele sur le fond du terminal, donc
+    // il en porte la couleur. Lui donner un accent a lui produisait une fleche
+    // orange vive au bord droit, pointant vers rien.
     line1.push_str(RESET);
-    line1.push_str(&rgb(BANNER_EXIT.0, BANNER_EXIT.1, BANNER_EXIT.2));
+    line1.push_str(&rgb(s2.0, s2.1, s2.2));
     line1.push_str(CHEVRON);
     line1.push_str(RESET);
     line1.push_str("\u{1b}]8;;\u{7}");
@@ -3134,7 +3134,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, vec!["Haiku 4.5".to_string()]);
     }
-    use super::{LOAD_HIGH, LOAD_MEDIUM, SYNC_FRESH, USAGE_MUTED_FG};
+    use super::{LOAD_HIGH, LOAD_MEDIUM, SEG_BG as SEG_BG_PALETTE, SYNC_FRESH, USAGE_MUTED_FG};
 
     // ---- Integrite de la palette ----
 
@@ -3178,5 +3178,35 @@ mod tests {
         let creme = rgb(TEXT_FG.0, TEXT_FG.1, TEXT_FG.2);
         assert!(l1.contains(&format!("{creme}d")), "le chemin est ecrit en creme");
         assert!(l1.contains(&format!("{creme} Opus 5")), "le modele est ecrit dans le meme creme");
+    }
+
+    // Grammaire powerline : un chevron prolonge le bloc dont il SORT, donc il
+    // en porte la couleur de fond. Le chevron final portait un accent a lui
+    // (le terracotta de marque), ce qui donnait une fleche orange vive flottant
+    // au bord droit et pointant vers rien.
+    #[test]
+    fn le_chevron_final_porte_la_couleur_du_bloc_qu_il_quitte() {
+        let l1 = build_line1(
+            "dev-environment",
+            &GitInfo::default(),
+            None,
+            Some("Opus 5"),
+            None,
+            None,
+            None,
+            None,
+            "file:///x",
+            "",
+        );
+        let fin = l1.rsplit_once(CHEVRON).expect("un chevron final").0;
+        let derniere_couleur = fin
+            .rsplit_once("\u{1b}[38;2;")
+            .map(|(_, reste)| reste.split('m').next().unwrap_or("").to_string())
+            .expect("une couleur avant le chevron");
+        assert_eq!(
+            derniere_couleur,
+            format!("{};{};{}", SEG_BG_PALETTE.0, SEG_BG_PALETTE.1, SEG_BG_PALETTE.2),
+            "le chevron final doit prolonger le bloc modele, pas porter un accent"
+        );
     }
 }
