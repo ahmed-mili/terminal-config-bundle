@@ -866,12 +866,68 @@ fn run_usage_refresh(claude_dir: &Path) {
     }
 }
 
-// =================== PRE-SHAPING ARABE POUR LA TUI CLAUDE ===================
-// La TUI de claude.exe applique le BiDi (elle inverse le run) mais ne fait pas
-// le shaping contextuel. On emet donc des formes de presentation U+FExx en ordre
-// LOGIQUE : Claude les remet ensuite en ordre visuel. Les emettre deja en ordre
-// visuel provoquerait une double inversion. Applique au chemin AFFICHE uniquement
-// -- compute_git() recoit toujours le chemin brut.
+// ================= PRE-SHAPING ARABE POUR LE TERMINAL HOTE =================
+// Le pre-shaping (formes de presentation U+FExx) supplee un renderer qui ne
+// fait pas le shaping contextuel : Windows Terminal, cf. microsoft/terminal#538.
+// Il a un cout -- chaque forme occupe une cellule monospace pleine, donc le mot
+// sort disloque (mim final detache, blancs parasites) meme quand les liaisons
+// sont justes. Un terminal qui shape ET reordonne lui-meme n'en a pas besoin et
+// rend nettement mieux le texte BRUT : c'est le cas de Warp, verifie a l'ecran
+// le 2026-08-27 contre son propre rendu natif du meme chemin.
+// Applique au chemin AFFICHE uniquement -- compute_git() recoit le chemin brut.
+
+/// Traitement a appliquer au run arabe avant emission.
+#[derive(Clone, Copy, PartialEq)]
+enum ArabicMode {
+    /// Aucun : le terminal shape et reordonne lui-meme (Warp).
+    Raw,
+    /// Formes de presentation en ordre logique, le renderer fait le BiDi (WT).
+    Logical,
+    /// Formes de presentation deja inversees, pour un renderer sans BiDi.
+    Visual,
+}
+
+impl ArabicMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ArabicMode::Raw => "raw",
+            ArabicMode::Logical => "logical",
+            ArabicMode::Visual => "visual",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "raw" => Some(ArabicMode::Raw),
+            "logical" => Some(ArabicMode::Logical),
+            "visual" => Some(ArabicMode::Visual),
+            _ => None,
+        }
+    }
+}
+
+/// Override par fichier (~/.claude/statusline-bidi.txt) puis par env
+/// (CLAUDE_STATUSLINE_BIDI), sinon detection du terminal. Le fichier permet de
+/// basculer a chaud : l'env d'un claude.exe deja lance n'est pas modifiable, et
+/// comparer deux rendus a l'ecran demande de changer de mode sans le relancer.
+fn arabic_mode() -> ArabicMode {
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let p = std::path::Path::new(&home).join(".claude/statusline-bidi.txt");
+        if let Some(m) = fs::read_to_string(&p).ok().and_then(|s| ArabicMode::parse(&s)) {
+            return m;
+        }
+    }
+    if let Some(m) = std::env::var("CLAUDE_STATUSLINE_BIDI")
+        .ok()
+        .and_then(|s| ArabicMode::parse(&s))
+    {
+        return m;
+    }
+    // Pas de detection de terminal : Warp comme Windows Terminal rendent le
+    // pre-shape logique a l'identique de leur propre rendu natif du chemin
+    // (mesure a l'ecran le 2026-08-27). Raw et Visual restent joignables par
+    // override, pour re-mesurer si un autre terminal se comporte autrement.
+    ArabicMode::Logical
+}
 
 /// (isolated, final, initial, medial) ; 0 = forme absente (right-joining :
 /// pas d'initial/medial ; hamza : isolated seule ; tatweel : inchange).
@@ -934,7 +990,8 @@ fn ar_lam_alef(cp: u32) -> Option<u32> {
     })
 }
 
-fn arabic_display(text: &str) -> String {
+/// `visual` : inverse chaque run arabe apres shaping (terminal sans BiDi).
+fn arabic_display(text: &str, visual: bool) -> String {
     // Fast path : rien a shaper (et idempotence, les U+FExx ne rematchent pas).
     if !text.chars().any(|c| (0x0621..=0x064A).contains(&(c as u32))) {
         return text.to_string();
@@ -975,9 +1032,9 @@ fn arabic_display(text: &str) -> String {
                     && ar_forms(clusters[k].0).is_some_and(|f| f[1] != 0)
             })
             .collect();
-        // Formes contextuelles + ligatures conservees en ordre logique. La TUI
-        // Claude effectuera elle-meme la reorganisation BiDi vers l'ordre visuel.
-        let mut logical: Vec<String> = Vec::new();
+        // Formes contextuelles + ligatures, construites en ordre logique. Le
+        // run n'est inverse ici que si le terminal hote ne fait pas le BiDi.
+        let mut pieces: Vec<String> = Vec::new();
         let mut k = 0;
         while k < clusters.len() {
             let b = clusters[k].0;
@@ -1018,9 +1075,12 @@ fn arabic_display(text: &str) -> String {
                 }
                 k += 1;
             }
-            logical.push(piece);
+            pieces.push(piece);
         }
-        for piece in &logical {
+        if visual {
+            pieces.reverse();
+        }
+        for piece in &pieces {
             out.push_str(piece);
         }
     }
@@ -1834,9 +1894,15 @@ fn main() {
     };
     let usage_ms = t_usage.elapsed().as_millis();
 
-    // Chemin pour l'AFFICHAGE seulement : pre-shaping arabe en ordre logique
-    // pour le BiDi de la TUI Claude. compute_git() a recu le chemin brut.
-    let dir_display = arabic_display(&dir);
+    // Chemin pour l'AFFICHAGE seulement : pre-shaping arabe, en ordre logique
+    // ou visuel selon que le terminal hote reordonne le RTL ou non.
+    // compute_git() a recu le chemin brut.
+    let ar_mode = arabic_mode();
+    let dir_display = match ar_mode {
+        ArabicMode::Raw => dir.clone(),
+        ArabicMode::Logical => arabic_display(&dir, false),
+        ArabicMode::Visual => arabic_display(&dir, true),
+    };
 
     let line1 = build_line1(
         &dir_display,
@@ -1877,10 +1943,13 @@ fn main() {
             let _ = fs::rename(&log_path, &old);
         }
         let line = format!(
-            "{} tick={} effort={} git_ms={} usage_ms={} usage_src={} api_status={} api_attempts={} api_ms={} total_ms={} pid={}\n",
+            "{} tick={} effort={} bidi={} git_ms={} usage_ms={} usage_src={} api_status={} api_attempts={} api_ms={} total_ms={} pid={}\n",
             start_ms_unix,
             picker_tick(start_ms_unix),
             effort.as_deref().unwrap_or("none"),
+            // Ordre d'emission du run arabe effectivement choisi : verifiable
+            // depuis un vrai spawn par claude.exe, sans avoir a lire l'env.
+            ar_mode.as_str(),
             git_ms,
             usage_ms,
             usage_src,
@@ -1925,7 +1994,8 @@ mod tests {
 
     #[test]
     fn ascii_inchange() {
-        assert_eq!(arabic_display(r"C:\dev\dev-environment"), r"C:\dev\dev-environment");
+        assert_eq!(arabic_display(r"C:\dev\dev-environment", false), r"C:\dev\dev-environment");
+        assert_eq!(arabic_display(r"C:\dev\dev-environment", true), r"C:\dev\dev-environment");
     }
 
     // al-islam (nom du vault) : memes vecteurs que test-arabic-display.ps1.
@@ -1933,27 +2003,48 @@ mod tests {
     fn al_islam_deux_ligatures() {
         let input = s(&[0x0627, 0x0644, 0x0625, 0x0633, 0x0644, 0x0627, 0x0645]);
         let want = s(&[0xFE8D, 0xFEF9, 0xFEB3, 0xFEFC, 0xFEE1]);
-        assert_eq!(arabic_display(&input), want);
+        assert_eq!(arabic_display(&input, false), want);
+    }
+
+    // Terminal sans BiDi (Warp) : meme shaping, run pose en ordre visuel --
+    // le mim final se retrouve a gauche, l'alef initial a droite.
+    #[test]
+    fn al_islam_ordre_visuel() {
+        let input = s(&[0x0627, 0x0644, 0x0625, 0x0633, 0x0644, 0x0627, 0x0645]);
+        let want = s(&[0xFEE1, 0xFEFC, 0xFEB3, 0xFEF9, 0xFE8D]);
+        assert_eq!(arabic_display(&input, true), want);
     }
 
     #[test]
     fn chemin_mixte_vault() {
         let input = format!(r"C:\obsidian-vaults\{}", s(&[0x0627, 0x0644, 0x0625, 0x0633, 0x0644, 0x0627, 0x0645]));
         let want = format!(r"C:\obsidian-vaults\{}", s(&[0xFE8D, 0xFEF9, 0xFEB3, 0xFEFC, 0xFEE1]));
-        assert_eq!(arabic_display(&input), want);
+        assert_eq!(arabic_display(&input, false), want);
+    }
+
+    // L'inversion ne doit toucher que le run arabe : le prefixe ASCII du
+    // chemin (lettre de lecteur, separateurs) reste en place.
+    #[test]
+    fn chemin_mixte_vault_visuel() {
+        let input = format!(r"C:\obsidian-vaults\{}", s(&[0x0627, 0x0644, 0x0625, 0x0633, 0x0644, 0x0627, 0x0645]));
+        let want = format!(r"C:\obsidian-vaults\{}", s(&[0xFEE1, 0xFEFC, 0xFEB3, 0xFEF9, 0xFE8D]));
+        assert_eq!(arabic_display(&input, true), want);
     }
 
     #[test]
     fn marhaban_right_joiners() {
         let input = s(&[0x0645, 0x0631, 0x062D, 0x0628, 0x0627]);
         let want = s(&[0xFEE3, 0xFEAE, 0xFEA3, 0xFE92, 0xFE8E]);
-        assert_eq!(arabic_display(&input), want);
+        assert_eq!(arabic_display(&input, false), want);
+        let want_visuel = s(&[0xFE8E, 0xFE92, 0xFEA3, 0xFEAE, 0xFEE3]);
+        assert_eq!(arabic_display(&input, true), want_visuel);
     }
 
     #[test]
     fn idempotence() {
         let shaped = s(&[0xFE8D, 0xFEF9, 0xFEB3, 0xFEFC, 0xFEE1]);
-        assert_eq!(arabic_display(&shaped), shaped);
+        assert_eq!(arabic_display(&shaped, false), shaped);
+        assert_eq!(arabic_display(&shaped, true), shaped);
     }
 
     #[test]
