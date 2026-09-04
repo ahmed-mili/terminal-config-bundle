@@ -27,11 +27,15 @@ if ($wanted.Count -eq 0) {
     exit 0
 }
 
-# Check which ones are actually installed
-# Format: "  ❯ name@marketplace"  (lines with the bullet marker)
-$installed = @(claude plugin list 2>$null | Where-Object { $_ -match '❯\s+(.+)' } | ForEach-Object { $matches[1].Trim() })
+# Check which ones are actually installed using structured output. The human-readable
+# marker has changed across Claude Code releases and is not a stable interface.
+$pluginJson = (& claude plugin list --json 2>$null) -join [Environment]::NewLine
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Unable to list installed Claude Code plugins."
+    exit 1
+}
+$installed = @(($pluginJson | ConvertFrom-Json) | ForEach-Object { $_.id } | Sort-Object -Unique)
 $missing = @($wanted | Where-Object {
-    $name = ($_ -split '@')[0]
     $pluginName = ($_ -split '@')[0] + '@' + ($_ -split '@')[1]
     $pluginName -notin $installed
 })
