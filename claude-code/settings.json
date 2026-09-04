@@ -41,6 +41,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$USERPROFILE/.claude/hooks/curfew.ps1\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$USERPROFILE/.claude/hooks/error-vault-trigger.ps1\"",
             "timeout": 10
           }
