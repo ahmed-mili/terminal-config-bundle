@@ -146,7 +146,31 @@ function Get-LatestGithubReleaseAsset {
 # (extracted, then TTFs matching $FilePattern are picked up) or a direct .ttf
 # URL (downloaded as-is). Each TTF is copied to %LOCALAPPDATA%\Microsoft\
 # Windows\Fonts and registered under HKCU so apps see it without re-login.
-# Idempotent: skips if $MarkerFile already exists in the user fonts dir.
+# Idempotent: an existing file is re-registered when its HKCU entry disappeared.
+function Register-UserFontFiles {
+    param(
+        [Parameter(Mandatory)] [System.IO.FileInfo[]]$FontFiles,
+        [Parameter(Mandatory)] [string]$UserFontsDir,
+        [string]$RegistryPath = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+    )
+
+    if (-not (Test-Path -LiteralPath $UserFontsDir)) {
+        New-Item -ItemType Directory -Path $UserFontsDir -Force | Out-Null
+    }
+
+    $registered = @()
+    foreach ($font in $FontFiles) {
+        $dest = Join-Path $UserFontsDir $font.Name
+        if ([IO.Path]::GetFullPath($font.FullName) -ne [IO.Path]::GetFullPath($dest)) {
+            Copy-Item -LiteralPath $font.FullName -Destination $dest -Force
+        }
+        $regName = "$([IO.Path]::GetFileNameWithoutExtension($font.Name)) (TrueType)"
+        New-ItemProperty -Path $RegistryPath -Name $regName -Value $dest -PropertyType String -Force | Out-Null
+        $registered += $dest
+    }
+    return $registered
+}
+
 function Install-UserFont {
     param(
         [Parameter(Mandatory)] [string]$DisplayName,
@@ -156,8 +180,34 @@ function Install-UserFont {
     )
     if ($SkipWinget) { return }
     $userFontsDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'
-    if (Test-Path (Join-Path $userFontsDir $MarkerFile)) {
-        Write-Ok $DisplayName
+    $markerPath = Join-Path $userFontsDir $MarkerFile
+    if (Test-Path -LiteralPath $markerPath) {
+        if ($FilePattern) {
+            $fontFiles = @(Get-ChildItem -LiteralPath $userFontsDir -Filter $FilePattern -File)
+        } else {
+            $fontFiles = @(Get-Item -LiteralPath $markerPath)
+        }
+        $fontRegistry = Get-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+        $registrationHealthy = $true
+        foreach ($font in $fontFiles) {
+            $regName = "$([IO.Path]::GetFileNameWithoutExtension($font.Name)) (TrueType)"
+            $entry = $fontRegistry.PSObject.Properties[$regName]
+            if (-not $entry -or [string]$entry.Value -ne $font.FullName) {
+                $registrationHealthy = $false
+                break
+            }
+        }
+        if ($registrationHealthy) {
+            Write-Ok $DisplayName
+            return
+        }
+        $installed = @(Register-UserFontFiles -FontFiles $fontFiles -UserFontsDir $userFontsDir)
+        foreach ($f in $installed) { [void][FontBroadcast]::AddFontResource($f) }
+        $res = [IntPtr]::Zero
+        # SMTO_ABORTIFHUNG prevents a hung top-level window from consuming the
+        # full timeout during this HWND_BROADCAST operation.
+        [void][FontBroadcast]::SendMessageTimeout([IntPtr]0xFFFF, 0x001D, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 1000, [ref]$res)
+        Write-Ok "$DisplayName (registration repaired)"
         return
     }
 
@@ -186,19 +236,7 @@ function Install-UserFont {
             return
         }
 
-        if (-not (Test-Path $userFontsDir)) {
-            New-Item -ItemType Directory -Path $userFontsDir -Force | Out-Null
-        }
-        $regPath = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-
-        $installed = @()
-        foreach ($ttf in $ttfs) {
-            $dest    = Join-Path $userFontsDir $ttf.Name
-            Copy-Item -Path $ttf.FullName -Destination $dest -Force
-            $regName = "$([IO.Path]::GetFileNameWithoutExtension($ttf.Name)) (TrueType)"
-            New-ItemProperty -Path $regPath -Name $regName -Value $dest -PropertyType String -Force | Out-Null
-            $installed += $dest
-        }
+        $installed = @(Register-UserFontFiles -FontFiles $ttfs -UserFontsDir $userFontsDir)
 
         # Make the new faces usable in the *current* session without a reboot or
         # re-login. Registering in HKCU alone is not enough: GDI/DirectWrite font
@@ -207,7 +245,7 @@ function Install-UserFont {
         # broadcast forces every running app to refresh its font list.
         foreach ($f in $installed) { [void][FontBroadcast]::AddFontResource($f) }
         $res = [IntPtr]::Zero
-        [void][FontBroadcast]::SendMessageTimeout([IntPtr]0xFFFF, 0x001D, [IntPtr]::Zero, [IntPtr]::Zero, 0, 1000, [ref]$res)
+        [void][FontBroadcast]::SendMessageTimeout([IntPtr]0xFFFF, 0x001D, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 1000, [ref]$res)
 
         Write-Ok "$DisplayName ($($ttfs.Count) faces)"
     } finally {
