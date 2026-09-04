@@ -93,32 +93,26 @@ fn run_git(dir: &str, args: &[&str]) -> Option<String> {
 // =================== USAGE / EFFORT / FORMATTING HELPERS ===================
 
 fn get_usage_color(pct: f64, stale: bool) -> String {
-    // Palette inspiree de la barre de contexte de claude.ai (couleurs relevees au
-    // pixel pres), bleu eclairci pour mieux ressortir sur fond sombre. Trois paliers :
-    //   0-69 %  -> bleu   #50A0F0 rgb(80,160,240)  (claude.ai #2A78D6 eclairci)
-    //   70-89 % -> jaune  #FAB219 rgb(250,178,25)
-    //   >= 90 % -> rouge  #D03B3B rgb(208,59,59)
-    // En mode stale (cache d'usage perime), memes teintes mais desaturees/ternies.
-    if stale {
-        if pct < 70.0 { return rgb(130, 165, 205); }
-        if pct < 90.0 { return rgb(200, 180, 120); }
-        return rgb(190, 125, 125);
-    }
-    if pct < 70.0 { return rgb(80, 160, 240); }
-    if pct < 90.0 { return rgb(250, 178, 25); }
-    rgb(208, 59, 59)
+    let color = if stale {
+        if pct < 70.0 {
+            LOAD_LOW_STALE
+        } else if pct < 90.0 {
+            LOAD_MEDIUM_STALE
+        } else {
+            LOAD_HIGH_STALE
+        }
+    } else if pct < 70.0 {
+        LOAD_LOW
+    } else if pct < 90.0 {
+        LOAD_MEDIUM
+    } else {
+        LOAD_HIGH
+    };
+    rgb(color.0, color.1, color.2)
 }
 
-// Couleur du contexte de fenetre (ligne 1, ex. "136k/1.0M tok"). Distincte de la
-// palette d'usage (bleu/jaune/rouge facon claude.ai) : le contexte n'est pas un
-// quota de session, donc bas niveau = vert (de la place libre) plutot que bleu.
-//   0-69 %  -> vert  #50FA7B rgb(80,250,123)
-//   70-89 % -> jaune #FAB219 rgb(250,178,25)
-//   >= 90 % -> rouge #D03B3B rgb(208,59,59)
 fn get_context_color(pct: f64) -> String {
-    if pct < 70.0 { return rgb(80, 250, 123); }
-    if pct < 90.0 { return rgb(250, 178, 25); }
-    rgb(208, 59, 59)
+    get_usage_color(pct, false)
 }
 
 fn format_tokens(n: i64) -> String {
@@ -140,7 +134,7 @@ fn format_bar(pct: f64, col: &str, width: usize) -> String {
     let empty = width - filled;
     // U+2501 est un glyphe box-drawing jointif entre cellules, contrairement a
     // U+25AC (rectangle geometrique) qui conserve des marges laterales visibles.
-    // Piste (track) calquee sur claude.ai : gris sombre #424240 rgb(66,66,64).
+    // Piste calquee sur claude.ai et centralisee dans RAIL.
     let rail = rgb(RAIL.0, RAIL.1, RAIL.2);
     format!(
         "{}{}{}{}{}",
@@ -480,7 +474,11 @@ fn format_agents(agents: &[String], main_model_display: &str) -> String {
         return String::new();
     }
     if agents.iter().all(|agent| agent == main_model_display) {
-        return format!(" +{}", agents.len());
+        return if agents.len() == 1 {
+            " &1".to_string()
+        } else {
+            format!(" +{}", agents.len())
+        };
     }
 
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
@@ -494,7 +492,11 @@ fn format_agents(agents: &[String], main_model_display: &str) -> String {
 
     let mut suffix = String::new();
     for (name, count) in groups {
-        suffix.push_str(&format!(" +{} {}", count, name));
+        if count == 1 {
+            suffix.push_str(&format!(" & {}", name));
+        } else {
+            suffix.push_str(&format!(" +{} {}", count, name));
+        }
     }
     suffix
 }
@@ -1365,24 +1367,64 @@ struct BannerSeg {
 // ryanoasis/nerd-fonts, pas de memoire :
 //   U+F01C5 nf-md-desktop_tower -> desktop
 //   U+F0322 nf-md-laptop        -> laptop  (idem config fastfetch, install.ps1)
-// Palette partagee par les deux lignes. Les deux bandeaux tirent desormais du
-// meme jeu de valeurs : un fond de segment secondaire commun (SEG_BG) donne aux
-// chips de la ligne 2 la meme assise que le bloc modele de la ligne 1.
-const SEG_BG: (u8, u8, u8) = (60, 64, 80);
-/// Attention douce : compteur de fichiers modifies, et fleches de sync quand le
-/// fetch de fond est plante. Assez saturee pour ressortir sur le bleu du path,
-/// sans le rouge d'une alerte.
-const AMBER: (u8, u8, u8) = (200, 170, 100);
-/// Violet Copilot (https://brand.github.com/foundations/color) : couleur
-/// signature GitHub pour les fleches ahead/behind d'un fetch a jour.
-const SYNC_FRESH: (u8, u8, u8) = (133, 52, 243);
-/// Fetch de fond plante : les fleches restent lisibles mais palies -- le compte
-/// affiche peut etre perime. Teinte distincte de l'ambre du dirty, qui lui est
-/// une donnee fraiche : deux signaux differents, deux couleurs.
-const SYNC_FADED: (u8, u8, u8) = (150, 120, 200);
-/// Gris de la piste des barres (claude.ai). Reserve au FOND d'une jauge : trop
-/// sombre pour du texte, les heures de reset gardent leur propre gris lisible.
+// Palette Claude unifiee. Les couleurs sources viennent de claude.exe 2.1.260 ;
+// RAIL est relevee sur claude.ai et les autres variantes signalent leur derive.
+/// Stop profond obtenu en assombrissant le brun du theme diagrams pour ouvrir la banniere.
+const BANNER_STOP_1: (u8, u8, u8) = (43, 37, 32);
+/// Stop intermediaire obtenu en assombrissant le brun du theme diagrams.
+const BANNER_STOP_2: (u8, u8, u8) = (74, 51, 40);
+/// Stop rust obtenu en assombrissant l'accent Claude pour fermer le degrade.
+const BANNER_STOP_3: (u8, u8, u8) = (110, 58, 40);
+/// Creme extrait du theme diagrams, reserve au texte principal sur fonds sombres.
+const TEXT_FG: (u8, u8, u8) = (244, 239, 228);
+/// Saumon obtenu en eclaircissant l'accent Claude pour isoler le compteur dirty.
+const DIRTY_FG: (u8, u8, u8) = (240, 165, 140);
+/// Or obtenu en decalant la teinte chaude Claude pour les fleches de sync fraiches.
+const SYNC_FRESH: (u8, u8, u8) = (217, 179, 130);
+/// Sync dont le fetch de fond est plante : le compte affiche peut etre perime.
+/// C'est SYNC_FRESH desature (40 % vers un gris chaud clair), pas assombri : sur
+/// un fond sombre, ternir en assombrissant fait chuter le contraste sous le
+/// seuil de lisibilite. Contraste 4.4 sur le stop le plus sombre du degrade --
+/// tout juste sous les 4.5 vises, mais SYNC_FRESH lui-meme n'y atteint que 4.7,
+/// donc aucune teinte plus terne ne peut faire mieux. Ecart de 10 dE avec le
+/// frais (visiblement terni) et de 22 dE avec AGENTS_FG, qui portait exactement
+/// la meme valeur avant : deux signaux sans rapport ne doivent pas se confondre.
+const SYNC_FADED: (u8, u8, u8) = (201, 177, 142);
+/// Accent de l'UI /usage extrait de claude.exe, reserve au chevron final sans texte.
+const BANNER_EXIT: (u8, u8, u8) = (218, 119, 86);
+/// Rust sombre obtenu en assombrissant l'argile Claude pour le mode bypassPermissions.
+const MODE_BYPASS_BG: (u8, u8, u8) = (110, 48, 40);
+/// Ardoise chaude obtenue en teintant les neutres Claude pour le mode plan.
+const MODE_PLAN_BG: (u8, u8, u8) = (47, 58, 66);
+/// Olive sombre obtenue en teintant les neutres Claude pour le mode acceptEdits.
+const MODE_ACCEPT_EDITS_BG: (u8, u8, u8) = (51, 64, 47);
+/// Prune sombre obtenue en teintant les neutres Claude pour le mode dontAsk.
+const MODE_DONT_ASK_BG: (u8, u8, u8) = (61, 50, 66);
+/// Bronze sombre obtenu en teintant le brun Claude pour le mode auto.
+const MODE_AUTO_BG: (u8, u8, u8) = (74, 58, 36);
+/// Sombre chaud extrait de la paire light du theme diagrams pour le bloc modele.
+const SEG_BG: (u8, u8, u8) = (31, 31, 30);
+/// Gris chaud extrait du theme diagrams pour subordonner le suffixe des agents.
+const AGENTS_FG: (u8, u8, u8) = (138, 127, 109);
+/// Accent /usage extrait de claude.exe pour le palier de charge nominal.
+const LOAD_LOW: (u8, u8, u8) = (218, 119, 86);
+/// Ambre obtenu en decalant l'accent Claude pour le palier de charge eleve.
+const LOAD_MEDIUM: (u8, u8, u8) = (224, 163, 60);
+/// Rouge obtenu en decalant l'accent Claude pour le palier de charge critique.
+const LOAD_HIGH: (u8, u8, u8) = (224, 80, 60);
+/// Variante nominale stale derivee par melange sRGB a 45 % vers le gris chaud discret.
+const LOAD_LOW_STALE: (u8, u8, u8) = (175, 114, 84);
+/// Variante elevee stale derivee par melange sRGB a 45 % vers le gris chaud discret.
+const LOAD_MEDIUM_STALE: (u8, u8, u8) = (178, 138, 70);
+/// Variante critique stale derivee par melange sRGB a 45 % vers le gris chaud discret.
+const LOAD_HIGH_STALE: (u8, u8, u8) = (178, 93, 70);
+/// Gris chaud obtenu en eclaircissant le neutre diagrams pour subordonner les labels.
+const USAGE_LABEL_FG: (u8, u8, u8) = (156, 139, 110);
+/// Gris chaud extrait du theme diagrams pour les resets et marqueurs perimes.
+const USAGE_MUTED_FG: (u8, u8, u8) = (122, 108, 82);
+/// Piste relevee sur claude.ai, conservee car elle appartient deja a la palette chaude.
 const RAIL: (u8, u8, u8) = (66, 66, 64);
+/// Glyphe Powerline conserve uniquement pour les transitions de la ligne 1.
 const CHEVRON: &str = "\u{E0B0}";
 
 const ICON_DESKTOP: &str = "\u{f01c5}";
@@ -1452,31 +1494,31 @@ fn build_line1(
     agents: &str,
 ) -> String {
     // Couleur de fin de banner (chevron + dernier stop ou fond uni)
-    let (p_r, p_g, p_b, grad_stops): (u8, u8, u8, Option<Vec<GradStop>>) = match mode {
-        Some("bypassPermissions") => (255, 121, 198, None),
-        Some("plan") => (139, 233, 253, None),
-        Some("acceptEdits") => (80, 250, 123, None),
-        Some("dontAsk") => (189, 147, 249, None),
-        Some("auto") => (255, 184, 108, None),
+    let (path_color, grad_stops): ((u8, u8, u8), Option<Vec<GradStop>>) = match mode {
+        Some("bypassPermissions") => (MODE_BYPASS_BG, None),
+        Some("plan") => (MODE_PLAN_BG, None),
+        Some("acceptEdits") => (MODE_ACCEPT_EDITS_BG, None),
+        Some("dontAsk") => (MODE_DONT_ASK_BG, None),
+        Some("auto") => (MODE_AUTO_BG, None),
         _ => {
             let stops = vec![
-                GradStop(180, 190, 254),
-                GradStop(137, 180, 250),
-                GradStop(116, 199, 236),
+                GradStop(BANNER_STOP_1.0, BANNER_STOP_1.1, BANNER_STOP_1.2),
+                GradStop(BANNER_STOP_2.0, BANNER_STOP_2.1, BANNER_STOP_2.2),
+                GradStop(BANNER_STOP_3.0, BANNER_STOP_3.1, BANNER_STOP_3.2),
             ];
             let last = stops.last().unwrap();
-            (last.0, last.1, last.2, Some(stops))
+            ((last.0, last.1, last.2), Some(stops))
         }
     };
-    let path_fg = rgb(p_r, p_g, p_b);
-    let path_bg = bg(p_r, p_g, p_b);
+    let path_fg = rgb(path_color.0, path_color.1, path_color.2);
+    let path_bg = bg(path_color.0, path_color.1, path_color.2);
 
     // Section 2 (model + ctx)
     let s2 = SEG_BG;
     let s2_bg = bg(s2.0, s2.1, s2.2);
-    let s2_fg = rgb(220, 220, 220);
+    let s2_fg = rgb(TEXT_FG.0, TEXT_FG.1, TEXT_FG.2);
 
-    let path_text_fg = rgb(25, 28, 42);
+    let path_text_fg = s2_fg.clone();
 
     // Construction segments du banner path. L'icone machine est DANS le meme
     // segment que le chemin : elle herite du fond (degrade ou uni selon le mode)
@@ -1490,19 +1532,14 @@ fn build_line1(
     }];
 
     if let Some(branch) = &git.branch {
-        // Texte git unifie avec celui du path : meme couleur sombre sur le fond
-        // bleu degrade -- les parentheses suffisent a delimiter le bloc git, pas
-        // besoin d'un gris distinct qui creait une 2e teinte sur la meme banniere.
+        // Texte git unifie avec celui du path : le creme reste lisible sur tous
+        // les fonds sombres et les parentheses suffisent a delimiter le bloc.
         let branch_fg = path_text_fg.clone();
-        // Le compteur de fichiers modifies portait la couleur sombre du chemin :
-        // noye dans la banniere alors qu'il signale du travail non commite,
-        // l'etat le plus actionnable du bloc git. Il passe en ambre.
-        let dirty_fg = rgb(AMBER.0, AMBER.1, AMBER.2);
-        // Sync arrows ↑/↓ en violet Copilot (#8534F3, https://brand.github.com/
-        // foundations/color) -- couleur signature GitHub, saturee donc visible
-        // sur le fond bleu clair du path, sans avoir l'air d'une alerte (sinon
-        // ça crierait à chaque commit non poussé). Le jaune fetch_stale reste
-        // en alerte distincte (le fetch background est planté = info perimee).
+        // Le saumon distingue le travail non commite du texte creme sans le
+        // confondre avec les fleches de synchronisation.
+        let dirty_fg = rgb(DIRTY_FG.0, DIRTY_FG.1, DIRTY_FG.2);
+        // L'or reste distinct du saumon quand le fetch est frais ; le gris chaud
+        // recule les comptes dont la reference distante peut etre perimee.
         let branch_sync_fg = if git.fetch_stale {
             rgb(SYNC_FADED.0, SYNC_FADED.1, SYNC_FADED.2)
         } else {
@@ -1617,7 +1654,7 @@ fn build_line1(
     if let Some(m) = model {
         line1.push_str(m);
         if !agents.is_empty() {
-            line1.push_str(&rgb(150, 155, 175));
+            line1.push_str(&rgb(AGENTS_FG.0, AGENTS_FG.1, AGENTS_FG.2));
             line1.push_str(agents);
             line1.push_str(&s2_fg);
         }
@@ -1647,7 +1684,7 @@ fn build_line1(
 
     // Chevron final
     line1.push_str(RESET);
-    line1.push_str(&rgb(s2.0, s2.1, s2.2));
+    line1.push_str(&rgb(BANNER_EXIT.0, BANNER_EXIT.1, BANNER_EXIT.2));
     line1.push_str(CHEVRON);
     line1.push_str(RESET);
     line1.push_str("\u{1b}]8;;\u{7}");
@@ -1665,14 +1702,8 @@ fn render_usage_seg(
     reset: Option<&str>,
 ) -> String {
     let mut seg = String::new();
-    seg.push_str(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2));
-    seg.push_str(col);
-    seg.push(' ');
+    seg.push_str(&rgb(USAGE_LABEL_FG.0, USAGE_LABEL_FG.1, USAGE_LABEL_FG.2));
     seg.push_str(label);
-    seg.push(' ');
-    seg.push_str(RESET);
-    seg.push_str(&rgb(SEG_BG.0, SEG_BG.1, SEG_BG.2));
-    seg.push_str(CHEVRON);
     seg.push_str(RESET);
     seg.push(' ');
     seg.push_str(&format_bar(util, col, 14));
@@ -1684,7 +1715,7 @@ fn render_usage_seg(
     }
     seg.push_str(RESET);
     if let Some(value) = reset {
-        let reset_col = rgb(140, 145, 165);
+        let reset_col = rgb(USAGE_MUTED_FG.0, USAGE_MUTED_FG.1, USAGE_MUTED_FG.2);
         seg.push_str(&format!(" {}({}){}", reset_col, value, RESET));
     }
     seg
@@ -1708,7 +1739,7 @@ fn build_usage_seg(label: &str, util: f64, resets_at: &Value, stale: bool, refer
     {
         let now = Utc::now();
         if reset_utc <= now {
-            let grey = rgb(140, 145, 165);
+            let grey = rgb(USAGE_MUTED_FG.0, USAGE_MUTED_FG.1, USAGE_MUTED_FG.2);
             let age = fmt_age(now.signed_duration_since(reset_utc).num_seconds());
             let reset = format!("p\u{00E9}rim\u{00E9} {}", age);
             return render_usage_seg(label, util, &grey, None, Some(&reset));
@@ -2665,7 +2696,11 @@ mod tests {
             "file:///C:/v/%D8%A7%D9%84"
         );
     }
-    use super::{build_line1, build_line2, bg, rgb, GitInfo, UsageResult, UsageSource, AMBER, CHEVRON, SEG_BG, SYNC_FADED};
+    use super::{
+        build_line1, build_line2, get_context_color, get_usage_color, rgb, GitInfo,
+        UsageResult, UsageSource, AGENTS_FG, CHEVRON, DIRTY_FG, SYNC_FADED,
+        TEXT_FG, USAGE_LABEL_FG,
+    };
 
     // =============== GRAMMAIRE POWERLINE PARTAGEE ===============
 
@@ -2721,8 +2756,11 @@ mod tests {
             "",
         );
         assert!(
-            l1.contains(&format!("{}*5", rgb(AMBER.0, AMBER.1, AMBER.2))),
-            "le compteur dirty doit etre en ambre"
+            l1.contains(&format!(
+                "{}*5",
+                rgb(DIRTY_FG.0, DIRTY_FG.1, DIRTY_FG.2)
+            )),
+            "le compteur dirty doit etre en saumon"
         );
     }
 
@@ -2742,37 +2780,42 @@ mod tests {
             "file:///x",
             "",
         );
-        let amber = rgb(AMBER.0, AMBER.1, AMBER.2);
+        let dirty = rgb(DIRTY_FG.0, DIRTY_FG.1, DIRTY_FG.2);
         let faded = rgb(SYNC_FADED.0, SYNC_FADED.1, SYNC_FADED.2);
-        assert_ne!(amber, faded);
+        assert_ne!(dirty, faded);
         assert!(l1.contains(&format!("{faded}\u{2191}2")), "fleche palie");
-        assert!(l1.contains(&format!("{amber}*5")), "dirty en ambre");
+        assert!(l1.contains(&format!("{dirty}*5")), "dirty en saumon");
     }
 
-    // Ligne 2 alignee sur la grammaire de la ligne 1 : label sur un fond plein,
-    // chevron de sortie. Sans ca les deux lignes lisent comme deux programmes.
+    // La hierarchie de la ligne 2 repose sur la couleur : le label reste en
+    // retrait sans reintroduire la forme Powerline de la banniere.
     #[test]
-    fn usage_seg_pose_son_label_sur_un_chip_powerline() {
+    fn usage_seg_colore_le_label_sans_chevron() {
         let future = Value::from("2099-01-01T00:00:00+00:00");
         let seg = build_usage_seg("5h", 42.0, &future, false, None);
         assert!(
-            seg.contains(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2)),
-            "label pose sur le fond des segments secondaires"
+            seg.starts_with(&format!(
+                "{}5h",
+                rgb(
+                    USAGE_LABEL_FG.0,
+                    USAGE_LABEL_FG.1,
+                    USAGE_LABEL_FG.2
+                )
+            )),
+            "le label doit porter la couleur en retrait"
         );
-        assert!(seg.contains(CHEVRON), "chevron de sortie du chip");
+        assert!(!seg.contains(CHEVRON), "la ligne 2 ne doit plus contenir de chevron");
     }
 
-    // Meme grammaire pour une fenetre expiree : seule la couleur change.
     #[test]
-    fn usage_seg_expire_garde_le_chip() {
-        let past = Value::from("2020-01-01T00:00:00+00:00");
-        let seg = build_usage_seg("5h", 100.0, &past, false, None);
-        assert!(seg.contains(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2)));
-        assert!(seg.contains(CHEVRON));
+    fn contexte_reutilise_la_rampe_d_usage() {
+        for pct in [0.0, 69.9, 70.0, 89.9, 90.0, 100.0] {
+            assert_eq!(get_context_color(pct), get_usage_color(pct, false));
+        }
     }
 
-    // Les chips delimitent deja les blocs : le point median n'ajoutait rien et
-    // etait plus lumineux que les donnees qu'il separait.
+    // Les espaces delimitent deja les blocs : le point median n'ajoutait rien
+    // et etait plus lumineux que les donnees qu'il separait.
     #[test]
     fn line2_ne_separe_plus_par_un_point_median() {
         let usage = UsageResult {
@@ -2793,7 +2836,7 @@ mod tests {
     }
 
     #[test]
-    fn line2_ollama_utilise_un_chip_et_preserve_le_pct_decimal() {
+    fn line2_ollama_sans_chevron_preserve_le_pct_decimal() {
         let usage = json!({
             "session": {
                 "utilization": 3.5,
@@ -2802,8 +2845,7 @@ mod tests {
             }
         });
         let l2 = super::build_line2_ollama(&usage);
-        assert!(l2.contains(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2)));
-        assert!(l2.contains(CHEVRON));
+        assert!(!l2.contains(CHEVRON));
         assert!(l2.contains("3.5 %"), "la chaine formatee par Ollama est preservee");
     }
 
@@ -2900,8 +2942,13 @@ mod tests {
         assert_eq!(format_agents(&a, "Opus 5"), " +2");
     }
 
-    // Des qu'il y a plusieurs modeles, TOUS les groupes sont nommes : un "+1"
-    // nu au milieu de groupes nommes serait illisible. Ordre par effectif
+    #[test]
+    fn agent_singulier_sur_le_modele_principal_omet_le_nom() {
+        let a = vec!["Opus 5".to_string()];
+        assert_eq!(format_agents(&a, "Opus 5"), " &1");
+    }
+
+    // Des qu'il y a plusieurs modeles, TOUS les groupes sont nommes. Ordre par effectif
     // decroissant, puis alphabetique -- deterministe, donc les colonnes ne
     // dansent pas d'un tick a l'autre.
     #[test]
@@ -2911,13 +2958,13 @@ mod tests {
             "Opus 5".to_string(),
             "Sonnet 5".to_string(),
         ];
-        assert_eq!(format_agents(&a, "Opus 5"), " +2 Sonnet 5 +1 Opus 5");
+        assert_eq!(format_agents(&a, "Opus 5"), " +2 Sonnet 5 & Opus 5");
     }
 
     #[test]
     fn groupes_a_effectif_egal_ordonnes_alphabetiquement() {
         let a = vec!["Sonnet 5".to_string(), "Haiku 4.5".to_string()];
-        assert_eq!(format_agents(&a, "Opus 5"), " +1 Haiku 4.5 +1 Sonnet 5");
+        assert_eq!(format_agents(&a, "Opus 5"), " & Haiku 4.5 & Sonnet 5");
     }
 
     // Le suffixe nuance le modele sans voler la couleur de l'effort qui suit.
@@ -2936,8 +2983,8 @@ mod tests {
             "file:///x",
             suffix,
         );
-        let agents_color = rgb(150, 155, 175);
-        let block_color = rgb(220, 220, 220);
+        let agents_color = rgb(AGENTS_FG.0, AGENTS_FG.1, AGENTS_FG.2);
+        let block_color = rgb(TEXT_FG.0, TEXT_FG.1, TEXT_FG.2);
         assert!(
             l1.contains(&format!("Opus 5{agents_color}{suffix}{block_color}  ")),
             "suffixe agents colore puis couleur du bloc restauree"
@@ -3086,5 +3133,50 @@ mod tests {
         let got = scan_live_agents(&dir, AGENT_MAX_AGE_SECS);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, vec!["Haiku 4.5".to_string()]);
+    }
+    use super::{LOAD_HIGH, LOAD_MEDIUM, SYNC_FRESH, USAGE_MUTED_FG};
+
+    // ---- Integrite de la palette ----
+
+    // Deux signaux sans rapport ne doivent pas porter la meme valeur : changer
+    // l'un changerait l'autre a son insu. SYNC_FADED et AGENTS_FG ont
+    // effectivement partage #8a7f6d, chacun l'ayant pioche dans les gris chauds
+    // du theme diagrams. Les paires listees ici sont celles qui se ressemblent
+    // assez pour que la confusion se reproduise.
+    #[test]
+    fn deux_signaux_distincts_ne_partagent_pas_une_couleur() {
+        let paires: [(&str, (u8, u8, u8), &str, (u8, u8, u8)); 5] = [
+            ("SYNC_FADED", SYNC_FADED, "AGENTS_FG", AGENTS_FG),
+            ("SYNC_FADED", SYNC_FADED, "SYNC_FRESH", SYNC_FRESH),
+            ("DIRTY_FG", DIRTY_FG, "SYNC_FRESH", SYNC_FRESH),
+            ("USAGE_LABEL_FG", USAGE_LABEL_FG, "USAGE_MUTED_FG", USAGE_MUTED_FG),
+            ("LOAD_MEDIUM", LOAD_MEDIUM, "LOAD_HIGH", LOAD_HIGH),
+        ];
+        for (na, a, nb, b) in paires {
+            assert_ne!(a, b, "{na} et {nb} portent la meme couleur");
+        }
+    }
+
+    // Le texte de la banniere, du bloc modele et de la ligne "tok" est le MEME
+    // creme : c'est une demande explicite (plus jamais de texte sombre sur la
+    // banniere). Si quelqu'un redonne au chemin une couleur a lui, ce test le
+    // rattrape.
+    #[test]
+    fn la_banniere_et_le_bloc_modele_partagent_leur_couleur_de_texte() {
+        let l1 = build_line1(
+            "dev-environment",
+            &GitInfo::default(),
+            None,
+            Some("Opus 5"),
+            None,
+            None,
+            None,
+            None,
+            "file:///x",
+            "",
+        );
+        let creme = rgb(TEXT_FG.0, TEXT_FG.1, TEXT_FG.2);
+        assert!(l1.contains(&format!("{creme}d")), "le chemin est ecrit en creme");
+        assert!(l1.contains(&format!("{creme} Opus 5")), "le modele est ecrit dans le meme creme");
     }
 }
