@@ -14,7 +14,7 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -141,7 +141,7 @@ fn format_bar(pct: f64, col: &str, width: usize) -> String {
     // U+2501 est un glyphe box-drawing jointif entre cellules, contrairement a
     // U+25AC (rectangle geometrique) qui conserve des marges laterales visibles.
     // Piste (track) calquee sur claude.ai : gris sombre #424240 rgb(66,66,64).
-    let rail = rgb(66, 66, 64);
+    let rail = rgb(RAIL.0, RAIL.1, RAIL.2);
     format!(
         "{}{}{}{}{}",
         col,
@@ -249,10 +249,264 @@ fn fmt_age(secs: i64) -> String {
     format!("{}j", h / 24)
 }
 
+// =================== CHEMIN AFFICHE ===================
+
+/// Separateur dominant du chemin, pour reconstruire une elision qui ne melange
+/// pas les styles (un chemin Windows garde ses backslashes).
+fn path_sep(path: &str) -> char {
+    if path.contains('\\') { '\\' } else { '/' }
+}
+
+fn trim_sep(path: &str) -> &str {
+    let t = path.trim_end_matches(['\\', '/']);
+    if t.is_empty() { path } else { t }
+}
+
+/// Remplace le milieu du chemin par une ellipse jusqu'a tenir dans `budget`
+/// caracteres. Le premier segment (repo, `~`, lettre de lecteur) situe, le
+/// dernier dit ou on est : ce sont les deux qu'on sacrifie en dernier. Un
+/// segment n'est jamais coupe en son milieu -- un nom de dossier tronque est
+/// un nom faux, plus nuisible qu'une ligne qui deborde d'un cran.
+fn elide_middle(path: &str, budget: usize) -> String {
+    if path.chars().count() <= budget {
+        return path.to_string();
+    }
+    let sep = path_sep(path);
+    let segs: Vec<&str> = path.split(['\\', '/']).collect();
+    if segs.len() < 3 {
+        return path.to_string();
+    }
+    let first = segs[0];
+    let last = segs[segs.len() - 1];
+    let ell = '\u{2026}';
+
+    let with_first = format!("{first}{sep}{ell}{sep}{last}");
+    if with_first.chars().count() <= budget {
+        return with_first;
+    }
+    let without_first = format!("{ell}{sep}{last}");
+    if without_first.chars().count() <= budget {
+        return without_first;
+    }
+    last.to_string()
+}
+
+/// Chemin destine a l'AFFICHAGE. Trois reecritures successives, de la plus
+/// informative a la plus econome :
+///   1. dans un depot git -> `<nom du repo>\<sous-chemin>` (la lettre de
+///      lecteur et le dossier parent du repo n'apprennent rien qu'on relise
+///      a chaque tick) ;
+///   2. sinon sous le profil utilisateur -> prefixe replie en `~` ;
+///   3. puis elision du milieu si ca depasse encore le budget.
+/// Le chemin absolu complet reste atteignable : build_line1 l'expose en
+/// hyperlien OSC 8 (survol = infobulle, Ctrl+clic = ouverture du dossier).
+fn display_path(dir: &str, git_root: Option<&str>, home: Option<&str>, budget: usize) -> String {
+    let dir_n = trim_sep(dir);
+
+    // Prefixe presente uniquement si dir est bien SOUS root (frontiere sur un
+    // separateur), pour ne pas replier `C:\devtools` sur un root `C:\dev`.
+    let strip = |root: &str| -> Option<String> {
+        let root_n = trim_sep(root);
+        if dir_n.eq_ignore_ascii_case(root_n) {
+            return Some(String::new());
+        }
+        if dir_n.len() <= root_n.len() || !dir_n.is_char_boundary(root_n.len()) {
+            return None;
+        }
+        if !dir_n[..root_n.len()].eq_ignore_ascii_case(root_n) {
+            return None;
+        }
+        let rest = &dir_n[root_n.len()..];
+        if rest.starts_with(['\\', '/']) { Some(rest.to_string()) } else { None }
+    };
+
+    let base = git_root
+        .and_then(|root| {
+            let repo = trim_sep(root).rsplit(['\\', '/']).next().unwrap_or("");
+            strip(root).map(|rest| format!("{repo}{rest}"))
+        })
+        .or_else(|| home.and_then(|h| strip(h).map(|rest| format!("~{rest}"))))
+        .unwrap_or_else(|| dir_n.to_string());
+
+    elide_middle(&base, budget)
+}
+
+/// URI `file://` du chemin ABSOLU, pour l'hyperlien OSC 8. Percent-encodage sur
+/// les octets UTF-8 (RFC 3986) : un vault au nom arabe doit rester ouvrable.
+fn file_uri(path: &str) -> String {
+    let mut out = String::from("file:///");
+    for b in path.replace('\\', "/").bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+// =================== SOUS-AGENTS VIVANTS ===================
+
+// Sur 1225 intervalles reels, le p99 entre deux ecritures etait de 35 s. La
+// marge a 90 s evite de declarer fini un agent momentanement silencieux.
+const AGENT_MAX_AGE_SECS: u64 = 90;
+
+fn capitalize_first(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().chain(chars).collect())
+}
+
+fn model_display_name(id: &str) -> String {
+    let Some(rest) = id.strip_prefix("claude-") else {
+        return id.to_string();
+    };
+    let mut parts: Vec<&str> = rest.split('-').collect();
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+        return id.to_string();
+    }
+    if parts
+        .last()
+        .is_some_and(|part| part.len() == 8 && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        parts.pop();
+    }
+    if parts.len() < 2 {
+        return id.to_string();
+    }
+    let family = capitalize_first(parts[0]).unwrap_or_else(|| parts[0].to_string());
+    format!("{} {}", family, parts[1..].join("."))
+}
+
+fn subagents_dir(transcript_path: &str) -> Option<PathBuf> {
+    let mut session_path = PathBuf::from(transcript_path);
+    if session_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return None;
+    }
+    session_path.set_extension("");
+    Some(session_path.join("subagents"))
+}
+
+fn agent_model_display(tail: &str, alias: Option<&str>) -> Option<String> {
+    const MODEL_PREFIX: &str = "\"model\":\"claude-";
+    if let Some(pos) = tail.rfind(MODEL_PREFIX) {
+        let value_start = pos + "\"model\":\"".len();
+        let value = &tail[value_start..];
+        if let Some(value_end) = value.find('"') {
+            return Some(model_display_name(&value[..value_end]));
+        }
+    }
+    alias.and_then(capitalize_first)
+}
+
+fn last_activity_secs(tail: &str, now: DateTime<Utc>) -> Option<i64> {
+    const TIMESTAMP_PREFIX: &str = "\"timestamp\":\"";
+    let value_start = tail.rfind(TIMESTAMP_PREFIX)? + TIMESTAMP_PREFIX.len();
+    let value = &tail[value_start..];
+    let value_end = value.find('"')?;
+    let timestamp = DateTime::parse_from_rfc3339(&value[..value_end]).ok()?;
+    Some(
+        now.signed_duration_since(timestamp.with_timezone(&Utc))
+            .num_seconds(),
+    )
+}
+
+fn scan_live_agents(dir: &Path, max_age_secs: u64) -> Vec<String> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut agents = Vec::new();
+    for entry in entries.flatten() {
+        let meta_path = entry.path();
+        let Some(file_name) = meta_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(id) = file_name.strip_suffix(".meta.json") else {
+            continue;
+        };
+        let transcript = dir.join(format!("{}.jsonl", id));
+        let Ok(metadata) = fs::metadata(&transcript) else {
+            continue;
+        };
+        let Some(mtime) = metadata.modified().ok() else {
+            continue;
+        };
+        let age = SystemTime::now()
+            .duration_since(mtime)
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        if age >= max_age_secs as f64 {
+            continue;
+        }
+
+        let alias = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|meta| meta.get("model").and_then(Value::as_str).map(String::from));
+
+        // La queue contient l'id complet dans 7 cas sur 8 mesures. La borner a
+        // 8 Kio garde le cout stable meme quand les transcripts font des Mo.
+        let tail_len = metadata.len().min(8 * 1024) as usize;
+        let tail = fs::File::open(&transcript)
+            .ok()
+            .and_then(|mut file| {
+                file.seek(SeekFrom::End(-(tail_len as i64))).ok()?;
+                let mut bytes = Vec::with_capacity(tail_len);
+                file.take(tail_len as u64).read_to_end(&mut bytes).ok()?;
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .unwrap_or_default();
+
+        // Un `touch` a deja rajeuni un transcript inactif de 38 minutes :
+        // quand le journal fournit une preuve interne, le mtime ne fait plus foi.
+        if last_activity_secs(&tail, Utc::now()).is_some_and(|age| age >= max_age_secs as i64) {
+            continue;
+        }
+
+        if let Some(display) = agent_model_display(&tail, alias.as_deref()) {
+            agents.push(display);
+        }
+    }
+    agents
+}
+
+fn format_agents(agents: &[String], main_model_display: &str) -> String {
+    if agents.is_empty() {
+        return String::new();
+    }
+    if agents.iter().all(|agent| agent == main_model_display) {
+        return format!(" +{}", agents.len());
+    }
+
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for agent in agents {
+        *counts.entry(agent.as_str()).or_default() += 1;
+    }
+    let mut groups: Vec<(&str, usize)> = counts.into_iter().collect();
+    groups.sort_by(|(name_a, count_a), (name_b, count_b)| {
+        count_b.cmp(count_a).then_with(|| name_a.cmp(name_b))
+    });
+
+    let mut suffix = String::new();
+    for (name, count) in groups {
+        suffix.push_str(&format!(" +{} {}", count, name));
+    }
+    suffix
+}
+
 // =================== GIT ===================
 
 #[derive(Default)]
 struct GitInfo {
+    /// Racine du depot contenant le cwd, pour l'affichage repo-relatif du
+    /// chemin. Deja resolue par compute_git : la recalculer couterait un
+    /// deuxieme parcours des dossiers parents a chaque tick.
+    root: Option<PathBuf>,
     branch: Option<String>,
     sha: Option<String>,
     ahead: i32,
@@ -276,6 +530,7 @@ fn find_git_root(start: &str) -> Option<PathBuf> {
 fn compute_git(dir: &str) -> GitInfo {
     let mut info = GitInfo::default();
     let Some(root) = find_git_root(dir) else { return info; };
+    info.root = Some(root.clone());
 
     // Single git call: status --porcelain=v2 --branch returns branch, oid, ab, AND dirty.
     // Saves ~30-50ms vs an extra `git rev-parse --abbrev-ref HEAD` spawn on Windows,
@@ -1098,6 +1353,7 @@ struct GradStop(u8, u8, u8);
 struct BannerSeg {
     text: String,
     fg: String,
+    unbroken: bool,
 }
 
 // Icone de la machine ou tourne claude (pas celle ou sont les mains de l'user :
@@ -1109,6 +1365,26 @@ struct BannerSeg {
 // ryanoasis/nerd-fonts, pas de memoire :
 //   U+F01C5 nf-md-desktop_tower -> desktop
 //   U+F0322 nf-md-laptop        -> laptop  (idem config fastfetch, install.ps1)
+// Palette partagee par les deux lignes. Les deux bandeaux tirent desormais du
+// meme jeu de valeurs : un fond de segment secondaire commun (SEG_BG) donne aux
+// chips de la ligne 2 la meme assise que le bloc modele de la ligne 1.
+const SEG_BG: (u8, u8, u8) = (60, 64, 80);
+/// Attention douce : compteur de fichiers modifies, et fleches de sync quand le
+/// fetch de fond est plante. Assez saturee pour ressortir sur le bleu du path,
+/// sans le rouge d'une alerte.
+const AMBER: (u8, u8, u8) = (200, 170, 100);
+/// Violet Copilot (https://brand.github.com/foundations/color) : couleur
+/// signature GitHub pour les fleches ahead/behind d'un fetch a jour.
+const SYNC_FRESH: (u8, u8, u8) = (133, 52, 243);
+/// Fetch de fond plante : les fleches restent lisibles mais palies -- le compte
+/// affiche peut etre perime. Teinte distincte de l'ambre du dirty, qui lui est
+/// une donnee fraiche : deux signaux differents, deux couleurs.
+const SYNC_FADED: (u8, u8, u8) = (150, 120, 200);
+/// Gris de la piste des barres (claude.ai). Reserve au FOND d'une jauge : trop
+/// sombre pour du texte, les heures de reset gardent leur propre gris lisible.
+const RAIL: (u8, u8, u8) = (66, 66, 64);
+const CHEVRON: &str = "\u{E0B0}";
+
 const ICON_DESKTOP: &str = "\u{f01c5}";
 const ICON_LAPTOP: &str = "\u{f0322}";
 
@@ -1172,6 +1448,8 @@ fn build_line1(
     ctx_pct: Option<f64>,
     ctx_tokens: Option<i64>,
     ctx_size: Option<i64>,
+    uri: &str,
+    agents: &str,
 ) -> String {
     // Couleur de fin de banner (chevron + dernier stop ou fond uni)
     let (p_r, p_g, p_b, grad_stops): (u8, u8, u8, Option<Vec<GradStop>>) = match mode {
@@ -1194,12 +1472,11 @@ fn build_line1(
     let path_bg = bg(p_r, p_g, p_b);
 
     // Section 2 (model + ctx)
-    let s2 = (60u8, 64u8, 80u8);
+    let s2 = SEG_BG;
     let s2_bg = bg(s2.0, s2.1, s2.2);
     let s2_fg = rgb(220, 220, 220);
 
     let path_text_fg = rgb(25, 28, 42);
-    let chevron = '\u{E0B0}';
 
     // Construction segments du banner path. L'icone machine est DANS le meme
     // segment que le chemin : elle herite du fond (degrade ou uni selon le mode)
@@ -1209,6 +1486,7 @@ fn build_line1(
     let mut segs: Vec<BannerSeg> = vec![BannerSeg {
         text: format!(" {}  {}", device_icon(), dir),
         fg: path_text_fg.clone(),
+        unbroken: false,
     }];
 
     if let Some(branch) = &git.branch {
@@ -1216,32 +1494,50 @@ fn build_line1(
         // bleu degrade -- les parentheses suffisent a delimiter le bloc git, pas
         // besoin d'un gris distinct qui creait une 2e teinte sur la meme banniere.
         let branch_fg = path_text_fg.clone();
+        // Le compteur de fichiers modifies portait la couleur sombre du chemin :
+        // noye dans la banniere alors qu'il signale du travail non commite,
+        // l'etat le plus actionnable du bloc git. Il passe en ambre.
+        let dirty_fg = rgb(AMBER.0, AMBER.1, AMBER.2);
         // Sync arrows ↑/↓ en violet Copilot (#8534F3, https://brand.github.com/
         // foundations/color) -- couleur signature GitHub, saturee donc visible
         // sur le fond bleu clair du path, sans avoir l'air d'une alerte (sinon
         // ça crierait à chaque commit non poussé). Le jaune fetch_stale reste
         // en alerte distincte (le fetch background est planté = info perimee).
-        let branch_sync_fg = if git.fetch_stale { rgb(200, 170, 100) } else { rgb(133, 52, 243) };
+        let branch_sync_fg = if git.fetch_stale {
+            rgb(SYNC_FADED.0, SYNC_FADED.1, SYNC_FADED.2)
+        } else {
+            rgb(SYNC_FRESH.0, SYNC_FRESH.1, SYNC_FRESH.2)
+        };
 
         let mut prefix = format!(" ({}", branch);
         if let Some(sha) = &git.sha {
             prefix.push_str(&format!(" {}", sha));
         }
-        segs.push(BannerSeg { text: prefix, fg: branch_fg.clone() });
+        segs.push(BannerSeg { text: prefix, fg: branch_fg.clone(), unbroken: false });
         if git.ahead > 0 {
-            segs.push(BannerSeg { text: format!(" \u{2191}{}", git.ahead), fg: branch_sync_fg.clone() });
+            segs.push(BannerSeg { text: " ".to_string(), fg: branch_fg.clone(), unbroken: false });
+            segs.push(BannerSeg { text: format!("\u{2191}{}", git.ahead), fg: branch_sync_fg.clone(), unbroken: true });
         }
         if git.behind > 0 {
-            segs.push(BannerSeg { text: format!(" \u{2193}{}", git.behind), fg: branch_sync_fg.clone() });
+            segs.push(BannerSeg { text: " ".to_string(), fg: branch_fg.clone(), unbroken: false });
+            segs.push(BannerSeg { text: format!("\u{2193}{}", git.behind), fg: branch_sync_fg.clone(), unbroken: true });
         }
         if git.dirty > 0 {
-            segs.push(BannerSeg { text: format!(" *{}", git.dirty), fg: branch_fg.clone() });
+            segs.push(BannerSeg { text: " ".to_string(), fg: branch_fg.clone(), unbroken: false });
+            segs.push(BannerSeg { text: format!("*{}", git.dirty), fg: dirty_fg.clone(), unbroken: true });
         }
-        segs.push(BannerSeg { text: ")".to_string(), fg: branch_fg.clone() });
+        segs.push(BannerSeg { text: ")".to_string(), fg: branch_fg.clone(), unbroken: false });
     }
-    segs.push(BannerSeg { text: " ".to_string(), fg: path_text_fg.clone() });
+    segs.push(BannerSeg { text: " ".to_string(), fg: path_text_fg.clone(), unbroken: false });
 
     let mut line1 = String::new();
+
+    // Hyperlien OSC 8 : le bandeau entier devient cliquable et le terminal
+    // affiche la cible au survol. C'est ce qui rend l'elision du chemin sans
+    // perte -- le chemin absolu reste consultable et ouvrable (Ctrl+clic) sans
+    // que la statusline ait a gerer la souris. Un terminal qui ignore OSC 8
+    // ignore la sequence entiere : le rendu est inchange chez lui.
+    line1.push_str(&format!("\u{1b}]8;;{}\u{7}", uri));
 
     if let Some(stops) = &grad_stops {
         // Degrade per-character entre stops, interpolation lineaire
@@ -1269,6 +1565,16 @@ fn build_line1(
                 let bb = (a.2 as f64 + (b.2 as f64 - a.2 as f64) * t).round() as u8;
                 line1.push_str(&bg(r, g, bb));
                 line1.push_str(&s.fg);
+
+                // Une mesure Git est une unite semantique : inserer un SGR de
+                // fond entre sa fleche/etoile et ses chiffres fragmente le span
+                // colore. Son fond prend la couleur du debut, puis l'index du
+                // degrade avance de toute la largeur du token.
+                if s.unbroken {
+                    line1.push_str(&s.text);
+                    idx += chars.len();
+                    break;
+                }
 
                 if is_arabic_display_char(chars[j]) {
                     // Garder tout le run arabe sous un seul style ANSI. Des SGR
@@ -1303,13 +1609,18 @@ fn build_line1(
     // jauges de budget sont les barres 5h/7d/opus de la ligne 2.
     line1.push_str(&path_fg);
     line1.push_str(&s2_bg);
-    line1.push(chevron);
+    line1.push_str(CHEVRON);
 
     // Banner 2 : modele + effort + ctx
     line1.push_str(&s2_fg);
     line1.push(' ');
     if let Some(m) = model {
         line1.push_str(m);
+        if !agents.is_empty() {
+            line1.push_str(&rgb(150, 155, 175));
+            line1.push_str(agents);
+            line1.push_str(&s2_fg);
+        }
         line1.push_str("  ");
     }
 
@@ -1337,13 +1648,47 @@ fn build_line1(
     // Chevron final
     line1.push_str(RESET);
     line1.push_str(&rgb(s2.0, s2.1, s2.2));
-    line1.push(chevron);
+    line1.push_str(CHEVRON);
     line1.push_str(RESET);
+    line1.push_str("\u{1b}]8;;\u{7}");
 
     line1
 }
 
 // =================== BUILD LINE 2 (usage) ===================
+
+fn render_usage_seg(
+    label: &str,
+    util: f64,
+    col: &str,
+    pct: Option<&str>,
+    reset: Option<&str>,
+) -> String {
+    let mut seg = String::new();
+    seg.push_str(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2));
+    seg.push_str(col);
+    seg.push(' ');
+    seg.push_str(label);
+    seg.push(' ');
+    seg.push_str(RESET);
+    seg.push_str(&rgb(SEG_BG.0, SEG_BG.1, SEG_BG.2));
+    seg.push_str(CHEVRON);
+    seg.push_str(RESET);
+    seg.push(' ');
+    seg.push_str(&format_bar(util, col, 14));
+    seg.push(' ');
+    seg.push_str(col);
+    match pct {
+        Some(value) => seg.push_str(&format!("{} %", value)),
+        None => seg.push('\u{2014}'),
+    }
+    seg.push_str(RESET);
+    if let Some(value) = reset {
+        let reset_col = rgb(140, 145, 165);
+        seg.push_str(&format!(" {}({}){}", reset_col, value, RESET));
+    }
+    seg
+}
 
 fn build_usage_seg(label: &str, util: f64, resets_at: &Value, stale: bool, reference: Option<DateTime<Utc>>) -> String {
     // Fenetre EXPIREE : resets_at deja passe (compare a l'heure REELLE Utc::now(),
@@ -1364,30 +1709,22 @@ fn build_usage_seg(label: &str, util: f64, resets_at: &Value, stale: bool, refer
         let now = Utc::now();
         if reset_utc <= now {
             let grey = rgb(140, 145, 165);
-            let bar = format_bar(util, &grey, 14);
             let age = fmt_age(now.signed_duration_since(reset_utc).num_seconds());
-            return format!(
-                "{}{}{} {} {}\u{2014} (p\u{00E9}rim\u{00E9} {}){}",
-                grey, label, RESET, bar, grey, age, RESET
-            );
+            let reset = format!("p\u{00E9}rim\u{00E9} {}", age);
+            return render_usage_seg(label, util, &grey, None, Some(&reset));
         }
     }
 
     let col = get_usage_color(util, stale);
-    let bar = format_bar(util, &col, 14);
-    let mut seg = format!("{}{}{} {} {}{} %{}", col, label, RESET, bar, col, util as i64, RESET);
-    if let Some(rst) = format_reset(resets_at, reference) {
-        let reset_col = rgb(140, 145, 165);
-        seg.push_str(&format!(" {}({}){}", reset_col, rst, RESET));
-    }
-    seg
+    let pct = (util as i64).to_string();
+    let reset = format_reset(resets_at, reference);
+    render_usage_seg(label, util, &col, Some(&pct), reset.as_deref())
 }
 
 fn build_line2(usage: &UsageResult) -> String {
     let Some(u) = &usage.json else { return String::new(); };
     let stale = usage.stale;
     let reference = usage.reference;
-    let sep = format!(" {}\u{00B7}{} ", rgb(220, 220, 220), RESET);
 
     let mut segments: Vec<String> = Vec::new();
 
@@ -1412,7 +1749,7 @@ fn build_line2(usage: &UsageResult) -> String {
         }
     }
 
-    segments.join(&sep)
+    segments.join("  ")
 }
 
 // =================== OLLAMA CLOUD USAGE ===================
@@ -1532,13 +1869,11 @@ fn read_ollama_usage(claude_dir: &Path) -> Option<Value> {
 // Cloud. Labels "5h"/"7d" : la session Ollama se reinitialise toutes les 5 h et le
 // quota hebdomadaire tous les 7 j -- meme semantique que les fenetres Anthropic.
 fn build_line2_ollama(u: &Value) -> String {
-    let sep = format!(" {}\u{00B7}{} ", rgb(220, 220, 220), RESET);
     let mut segments: Vec<String> = Vec::new();
     for (key, label) in [("session", "5h"), ("weekly", "7d")] {
         if let Some(w) = u.get(key) {
             if let Some(util) = w.get("utilization").and_then(|v| v.as_f64()) {
                 let col = get_usage_color(util, false);
-                let bar = format_bar(util, &col, 14);
                 // pct = chaine exacte affichee par ollama.com (ex. "3.5"), repli sur
                 // l'entier tronque si absente. La barre, elle, utilise le float.
                 let pct = w
@@ -1546,19 +1881,12 @@ fn build_line2_ollama(u: &Value) -> String {
                     .and_then(|v| v.as_str())
                     .map(String::from)
                     .unwrap_or_else(|| (util as i64).to_string());
-                let mut seg = format!(
-                    "{}{}{} {} {}{} %{}",
-                    col, label, RESET, bar, col, pct, RESET
-                );
-                if let Some(rst) = w.get("reset").and_then(|v| v.as_str()) {
-                    let reset_col = rgb(140, 145, 165);
-                    seg.push_str(&format!(" {}({}){}", reset_col, rst, RESET));
-                }
-                segments.push(seg);
+                let reset = w.get("reset").and_then(|v| v.as_str());
+                segments.push(render_usage_seg(label, util, &col, Some(&pct), reset));
             }
         }
     }
-    segments.join(&sep)
+    segments.join("  ")
 }
 
 // =================== OLLAMA MODEL / CONTEXT WINDOW ===================
@@ -1723,6 +2051,11 @@ fn run_context_resolver(claude_dir: &Path, model: &str) {
 
 // =================== MAIN ===================
 
+// Le stdin de Claude Code fournit session_id, cwd, model, context_window et
+// rate_limits, mais aucune largeur de terminal. Ce budget fixe laisse de la
+// place au bloc modele + contexte sur un terminal de largeur courante.
+const DISPLAY_PATH_BUDGET: usize = 44;
+
 fn main() {
     // Mode resolver detache (cf. spawn_context_resolver) : resout la fenetre de
     // contexte d'un modele Ollama via `ollama show`, l'ecrit dans le cache, et
@@ -1834,6 +2167,13 @@ fn main() {
     let git = compute_git(&dir);
     let git_ms = t_git.elapsed().as_millis();
 
+    let agents = data
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .and_then(subagents_dir)
+        .map(|agents_dir| scan_live_agents(&agents_dir, AGENT_MAX_AGE_SECS))
+        .unwrap_or_default();
+
     let t_usage = Instant::now();
     // Mode Ollama (`ollama launch claude`) : on ne consomme pas le quota Anthropic,
     // donc afficher ses rate_limits serait trompeur. On source l'usage depuis Ollama
@@ -1876,6 +2216,10 @@ fn main() {
         }
     }
 
+    // Apres la resolution Ollama : `model` peut y avoir ete reassigne, et le
+    // suffixe se compare au modele REELLEMENT affiche a cote de lui.
+    let agents_suffix = format_agents(&agents, model.as_deref().unwrap_or(""));
+
     let mut usage_src = String::from("Ollama");
     let mut api_status_s = String::from("-");
     let mut api_attempts_v: u8 = 0;
@@ -1894,14 +2238,20 @@ fn main() {
     };
     let usage_ms = t_usage.elapsed().as_millis();
 
-    // Chemin pour l'AFFICHAGE seulement : pre-shaping arabe, en ordre logique
-    // ou visuel selon que le terminal hote reordonne le RTL ou non.
-    // compute_git() a recu le chemin brut.
+    // L'elision precede le shaping : les formes U+FExx occupent plus d'octets et
+    // fausseraient le budget si elles entraient dans le comptage du chemin.
+    // compute_git() et l'URI conservent le chemin absolu brut.
+    let dir_elided = display_path(
+        &dir,
+        git.root.as_deref().and_then(Path::to_str),
+        Some(&home),
+        DISPLAY_PATH_BUDGET,
+    );
     let ar_mode = arabic_mode();
     let dir_display = match ar_mode {
-        ArabicMode::Raw => dir.clone(),
-        ArabicMode::Logical => arabic_display(&dir, false),
-        ArabicMode::Visual => arabic_display(&dir, true),
+        ArabicMode::Raw => dir_elided.clone(),
+        ArabicMode::Logical => arabic_display(&dir_elided, false),
+        ArabicMode::Visual => arabic_display(&dir_elided, true),
     };
 
     let line1 = build_line1(
@@ -1913,6 +2263,8 @@ fn main() {
         ctx_pct,
         ctx_tokens,
         ctx_size,
+        &file_uri(&dir),
+        &agents_suffix,
     );
 
     let mut out = line1;
@@ -1943,13 +2295,14 @@ fn main() {
             let _ = fs::rename(&log_path, &old);
         }
         let line = format!(
-            "{} tick={} effort={} bidi={} git_ms={} usage_ms={} usage_src={} api_status={} api_attempts={} api_ms={} total_ms={} pid={}\n",
+            "{} tick={} effort={} bidi={} agents={} git_ms={} usage_ms={} usage_src={} api_status={} api_attempts={} api_ms={} total_ms={} pid={}\n",
             start_ms_unix,
             picker_tick(start_ms_unix),
             effort.as_deref().unwrap_or("none"),
             // Ordre d'emission du run arabe effectivement choisi : verifiable
             // depuis un vrai spawn par claude.exe, sans avoir a lire l'env.
             ar_mode.as_str(),
+            agents.len(),
             git_ms,
             usage_ms,
             usage_src,
@@ -2197,5 +2550,541 @@ mod tests {
         let (m, from_cache) = merge_usage_windows(stdin, Some(&cache), test_now());
         assert_eq!(m["seven_day"]["utilization"], 9.0, "fenetre absente du stdin completee par le cache vivant");
         assert!(from_cache);
+    }
+
+    // =============== CHEMIN AFFICHE (repo-relatif + elision) ===============
+
+    #[test]
+    fn racine_repo_affiche_le_nom_du_repo() {
+        assert_eq!(
+            super::display_path(r"C:\dev\dev-environment", Some(r"C:\dev\dev-environment"), None, 44),
+            "dev-environment"
+        );
+    }
+
+    #[test]
+    fn sous_dossier_repo_affiche_le_relatif_prefixe_du_repo() {
+        assert_eq!(
+            super::display_path(
+                r"C:\dev\dev-environment\claude-code\statusline-rs",
+                Some(r"C:\dev\dev-environment"),
+                None,
+                44
+            ),
+            r"dev-environment\claude-code\statusline-rs"
+        );
+    }
+
+    #[test]
+    fn hors_repo_sous_home_replie_en_tilde() {
+        assert_eq!(
+            super::display_path(r"C:\Users\Ahmed\Documents", None, Some(r"C:\Users\Ahmed"), 44),
+            r"~\Documents"
+        );
+    }
+
+    #[test]
+    fn hors_repo_hors_home_reste_absolu() {
+        assert_eq!(
+            super::display_path(r"C:\obsidian-vaults\Personal", None, Some(r"C:\Users\Ahmed"), 44),
+            r"C:\obsidian-vaults\Personal"
+        );
+    }
+
+    // Au-dela du budget, le milieu est remplace par une ellipse : le premier
+    // segment (repo, ~ ou lettre de lecteur) situe, le dernier dit ou on est.
+    #[test]
+    fn depassement_budget_elide_le_milieu() {
+        let out = super::display_path(
+            r"C:\obsidian-vaults\Personal\30 Ressources\Programmation\Rust",
+            None,
+            None,
+            30,
+        );
+        assert_eq!(out, "C:\\\u{2026}\\Rust");
+        assert!(out.chars().count() <= 30);
+    }
+
+    #[test]
+    fn elision_conserve_le_prefixe_du_repo() {
+        let out = super::display_path(
+            r"C:\dev\dev-environment\claude-code\statusline-rs\src",
+            Some(r"C:\dev\dev-environment"),
+            None,
+            24,
+        );
+        assert_eq!(out, "dev-environment\\\u{2026}\\src");
+    }
+
+    // Un dernier segment plus long que le budget est laisse intact : couper
+    // dedans donnerait un nom de dossier faux, pire qu'une ligne qui deborde.
+    #[test]
+    fn dernier_segment_plus_long_que_le_budget_reste_entier() {
+        assert_eq!(
+            super::display_path(r"C:\a\b\un-nom-de-dossier-vraiment-tres-long", None, None, 10),
+            "un-nom-de-dossier-vraiment-tres-long"
+        );
+    }
+
+    #[test]
+    fn segment_unique_jamais_elide() {
+        assert_eq!(super::display_path(r"C:\", None, None, 2), "C:");
+    }
+
+    // Le budget se compte en caracteres, pas en octets : un chemin arabe qui
+    // tient a l'ecran ne doit pas etre elide a cause de l'UTF-8 multi-octets.
+    #[test]
+    fn budget_compte_en_caracteres_pas_en_octets() {
+        let dir = format!(r"C:\obsidian-vaults\{}", s(&[0x0627, 0x0644, 0x0625, 0x0633, 0x0644, 0x0627, 0x0645]));
+        assert_eq!(super::display_path(&dir, None, None, 27), dir);
+    }
+
+    // =============== FILE URI (hyperlien OSC 8) ===============
+
+    #[test]
+    fn file_uri_backslashes_en_slashes() {
+        assert_eq!(
+            super::file_uri(r"C:\dev\dev-environment"),
+            "file:///C:/dev/dev-environment"
+        );
+    }
+
+    #[test]
+    fn file_uri_percent_encode_espaces() {
+        assert_eq!(
+            super::file_uri(r"C:\obsidian-vaults\30 Ressources"),
+            "file:///C:/obsidian-vaults/30%20Ressources"
+        );
+    }
+
+    // Vault arabe : percent-encodage des octets UTF-8, pas des points de code.
+    #[test]
+    fn file_uri_percent_encode_utf8() {
+        assert_eq!(
+            super::file_uri("C:\\v\\\u{0627}\u{0644}"),
+            "file:///C:/v/%D8%A7%D9%84"
+        );
+    }
+    use super::{build_line1, build_line2, bg, rgb, GitInfo, UsageResult, UsageSource, AMBER, CHEVRON, SEG_BG, SYNC_FADED};
+
+    // =============== GRAMMAIRE POWERLINE PARTAGEE ===============
+
+    fn git_pour_test(dirty: i32, ahead: i32, fetch_stale: bool) -> GitInfo {
+        GitInfo {
+            branch: Some("main".to_string()),
+            sha: Some("8f14b3e".to_string()),
+            ahead,
+            behind: 0,
+            dirty,
+            fetch_stale,
+            root: None,
+        }
+    }
+
+    // Le bandeau du chemin est un hyperlien : c'est ce qui rend le chemin
+    // complet lisible au survol malgre l'elision, sans code de gestion souris.
+    #[test]
+    fn banner_path_est_un_hyperlien_osc8() {
+        let uri = "file:///C:/dev/dev-environment";
+        let l1 = build_line1(
+            "dev-environment",
+            &GitInfo::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            uri,
+            "",
+        );
+        assert!(
+            l1.starts_with(&format!("\u{1b}]8;;{uri}\u{7}")),
+            "l'hyperlien doit ouvrir le bandeau"
+        );
+        assert!(l1.contains("\u{1b}]8;;\u{7}"), "hyperlien referme");
+    }
+
+    // Le compteur de fichiers modifies portait la couleur du chemin : invisible.
+    #[test]
+    fn dirty_porte_la_couleur_d_attention() {
+        let l1 = build_line1(
+            "dev-environment",
+            &git_pour_test(5, 0, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "file:///x",
+            "",
+        );
+        assert!(
+            l1.contains(&format!("{}*5", rgb(AMBER.0, AMBER.1, AMBER.2))),
+            "le compteur dirty doit etre en ambre"
+        );
+    }
+
+    // Un fetch en panne pale les fleches de sync ; il ne doit pas emprunter la
+    // couleur du dirty, sinon les deux signaux deviennent indistinguables.
+    #[test]
+    fn fetch_perime_et_dirty_ont_des_couleurs_distinctes() {
+        let l1 = build_line1(
+            "dev-environment",
+            &git_pour_test(5, 2, true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "file:///x",
+            "",
+        );
+        let amber = rgb(AMBER.0, AMBER.1, AMBER.2);
+        let faded = rgb(SYNC_FADED.0, SYNC_FADED.1, SYNC_FADED.2);
+        assert_ne!(amber, faded);
+        assert!(l1.contains(&format!("{faded}\u{2191}2")), "fleche palie");
+        assert!(l1.contains(&format!("{amber}*5")), "dirty en ambre");
+    }
+
+    // Ligne 2 alignee sur la grammaire de la ligne 1 : label sur un fond plein,
+    // chevron de sortie. Sans ca les deux lignes lisent comme deux programmes.
+    #[test]
+    fn usage_seg_pose_son_label_sur_un_chip_powerline() {
+        let future = Value::from("2099-01-01T00:00:00+00:00");
+        let seg = build_usage_seg("5h", 42.0, &future, false, None);
+        assert!(
+            seg.contains(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2)),
+            "label pose sur le fond des segments secondaires"
+        );
+        assert!(seg.contains(CHEVRON), "chevron de sortie du chip");
+    }
+
+    // Meme grammaire pour une fenetre expiree : seule la couleur change.
+    #[test]
+    fn usage_seg_expire_garde_le_chip() {
+        let past = Value::from("2020-01-01T00:00:00+00:00");
+        let seg = build_usage_seg("5h", 100.0, &past, false, None);
+        assert!(seg.contains(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2)));
+        assert!(seg.contains(CHEVRON));
+    }
+
+    // Les chips delimitent deja les blocs : le point median n'ajoutait rien et
+    // etait plus lumineux que les donnees qu'il separait.
+    #[test]
+    fn line2_ne_separe_plus_par_un_point_median() {
+        let usage = UsageResult {
+            json: Some(json!({
+                "five_hour": {"utilization": 64.0, "resets_at": "2099-01-01T00:00:00+00:00"},
+                "seven_day": {"utilization": 93.0, "resets_at": "2099-01-01T00:00:00+00:00"}
+            })),
+            stale: false,
+            reference: None,
+            source: UsageSource::Stdin,
+            api_ms: None,
+            api_status: None,
+            api_attempts: 0,
+        };
+        let l2 = build_line2(&usage);
+        assert!(l2.contains("64 %") && l2.contains("93 %"), "les deux fenetres rendues");
+        assert!(!l2.contains('\u{00B7}'), "plus de point median");
+    }
+
+    #[test]
+    fn line2_ollama_utilise_un_chip_et_preserve_le_pct_decimal() {
+        let usage = json!({
+            "session": {
+                "utilization": 3.5,
+                "pct": "3.5",
+                "reset": "2h"
+            }
+        });
+        let l2 = super::build_line2_ollama(&usage);
+        assert!(l2.contains(&bg(SEG_BG.0, SEG_BG.1, SEG_BG.2)));
+        assert!(l2.contains(CHEVRON));
+        assert!(l2.contains("3.5 %"), "la chaine formatee par Ollama est preservee");
+    }
+
+    // =============== SOUS-AGENTS VIVANTS ===============
+
+    use super::{agent_model_display, format_agents, model_display_name, scan_live_agents, subagents_dir, AGENT_MAX_AGE_SECS};
+
+    // Le nom affichable se DERIVE de l'id : coder "5" en dur perimerait a la
+    // generation suivante. claude-<famille>-<version>[-<date de build>].
+    #[test]
+    fn nom_de_modele_derive_de_l_id() {
+        assert_eq!(model_display_name("claude-sonnet-5"), "Sonnet 5");
+        assert_eq!(model_display_name("claude-opus-5"), "Opus 5");
+        assert_eq!(model_display_name("claude-haiku-4-5-20251001"), "Haiku 4.5");
+    }
+
+    // Id hors nomenclature (modele Ollama, alias interne) : rendu tel quel
+    // plutot que mutile par une regle qui ne s'applique pas.
+    #[test]
+    fn nom_de_modele_inconnu_rendu_tel_quel() {
+        assert_eq!(model_display_name("glm-5.2:cloud"), "glm-5.2:cloud");
+    }
+
+    // Le stdin donne transcript_path ; le dossier des sous-agents est son
+    // voisin, nomme d'apres la session. C'est le seul chainage disponible :
+    // le payload de claude.exe n'expose aucun champ agent.
+    #[test]
+    fn dossier_sous_agents_derive_du_transcript() {
+        let d = subagents_dir(r"C:\Users\A\.claude\projects\C--dev-x\abc-123.jsonl").unwrap();
+        assert_eq!(d, std::path::PathBuf::from(r"C:\Users\A\.claude\projects\C--dev-x\abc-123\subagents"));
+    }
+
+    #[test]
+    fn dossier_sous_agents_refuse_un_chemin_sans_extension() {
+        assert!(subagents_dir(r"C:\Users\A\.claude\projects\C--dev-x\abc-123").is_none());
+    }
+
+    // Modele exact lu en queue du transcript de l'agent : c'est la seule source
+    // qui porte la generation ("claude-sonnet-5"), le meta ne stocke qu'un alias.
+    #[test]
+    fn modele_agent_lu_en_queue_de_transcript() {
+        let tail = r#"{"type":"assistant","message":{"model":"claude-sonnet-5","role":"assistant"}}"#;
+        assert_eq!(agent_model_display(tail, Some("opus")).as_deref(), Some("Sonnet 5"));
+    }
+
+    // Derniere occurrence : un agent dont le modele a change en cours de route
+    // doit afficher celui sur lequel il tourne MAINTENANT.
+    #[test]
+    fn modele_agent_prend_la_derniere_occurrence() {
+        let tail = r#"{"model":"claude-opus-5"} {"model":"claude-sonnet-5"}"#;
+        assert_eq!(agent_model_display(tail, None).as_deref(), Some("Sonnet 5"));
+    }
+
+    // Queue occupee par un gros resultat d'outil : aucun id dedans, on retombe
+    // sur l'alias du meta. Mesure : 1 agent sur 8 dans une vraie session.
+    #[test]
+    fn modele_agent_repli_sur_l_alias_du_meta() {
+        assert_eq!(agent_model_display("{\"type\":\"user\"}", Some("sonnet")).as_deref(), Some("Sonnet"));
+    }
+
+    // Les entrees synthetiques de Claude Code portent model:"<synthetic>" :
+    // ce n'est pas un modele, ne pas l'afficher.
+    #[test]
+    fn modele_agent_ignore_les_entrees_synthetiques() {
+        let tail = r#"{"model":"claude-sonnet-5"} {"model":"<synthetic>"}"#;
+        assert_eq!(agent_model_display(tail, None).as_deref(), Some("Sonnet 5"));
+    }
+
+    #[test]
+    fn modele_agent_absent_partout_donne_none() {
+        assert_eq!(agent_model_display("{}", None), None);
+    }
+
+    // ---- Rendu du suffixe accole au modele principal ----
+
+    #[test]
+    fn sans_agent_vivant_aucun_suffixe() {
+        assert_eq!(format_agents(&[], "Opus 5"), "");
+    }
+
+    // Agents sur un AUTRE modele que la session : le nom est l'information.
+    #[test]
+    fn agents_sur_un_autre_modele_sont_nommes() {
+        let a = vec!["Sonnet 5".to_string(), "Sonnet 5".to_string()];
+        assert_eq!(format_agents(&a, "Opus 5"), " +2 Sonnet 5");
+    }
+
+    // Tous sur le modele de la session : le nom serait une redite, seul le
+    // compte informe. La PRESENCE d'un nom devient alors le signal "autre
+    // modele", ce qui se lit sans comparer.
+    #[test]
+    fn agents_sur_le_modele_principal_ne_repetent_pas_le_nom() {
+        let a = vec!["Opus 5".to_string(), "Opus 5".to_string()];
+        assert_eq!(format_agents(&a, "Opus 5"), " +2");
+    }
+
+    // Des qu'il y a plusieurs modeles, TOUS les groupes sont nommes : un "+1"
+    // nu au milieu de groupes nommes serait illisible. Ordre par effectif
+    // decroissant, puis alphabetique -- deterministe, donc les colonnes ne
+    // dansent pas d'un tick a l'autre.
+    #[test]
+    fn modeles_mixtes_nomment_tous_les_groupes() {
+        let a = vec![
+            "Sonnet 5".to_string(),
+            "Opus 5".to_string(),
+            "Sonnet 5".to_string(),
+        ];
+        assert_eq!(format_agents(&a, "Opus 5"), " +2 Sonnet 5 +1 Opus 5");
+    }
+
+    #[test]
+    fn groupes_a_effectif_egal_ordonnes_alphabetiquement() {
+        let a = vec!["Sonnet 5".to_string(), "Haiku 4.5".to_string()];
+        assert_eq!(format_agents(&a, "Opus 5"), " +1 Haiku 4.5 +1 Sonnet 5");
+    }
+
+    // Le suffixe nuance le modele sans voler la couleur de l'effort qui suit.
+    #[test]
+    fn suffixe_agents_porte_sa_couleur_puis_restaure_celle_du_bloc() {
+        let suffix = " +2 Sonnet 5";
+        let l1 = build_line1(
+            "dev-environment",
+            &GitInfo::default(),
+            None,
+            Some("Opus 5"),
+            None,
+            None,
+            None,
+            None,
+            "file:///x",
+            suffix,
+        );
+        let agents_color = rgb(150, 155, 175);
+        let block_color = rgb(220, 220, 220);
+        assert!(
+            l1.contains(&format!("Opus 5{agents_color}{suffix}{block_color}  ")),
+            "suffixe agents colore puis couleur du bloc restauree"
+        );
+    }
+
+    // ---- Vivacite (balayage disque) ----
+
+    fn ecrire_agent(dir: &std::path::Path, id: &str, alias: &str, model_id: &str, age_secs: u64) {
+        use std::time::{Duration, SystemTime};
+        std::fs::write(
+            dir.join(format!("{id}.meta.json")),
+            format!(r#"{{"agentType":"general-purpose","model":"{alias}"}}"#),
+        )
+        .unwrap();
+        let jl = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&jl, format!(r#"{{"message":{{"model":"{model_id}"}}}}"#)).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&jl).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(age_secs)).unwrap();
+    }
+
+    // Un agent termine laisse son meta ET son transcript sur le disque : seule
+    // la fraicheur du mtime distingue le vivant du fini. Mesure sur une vraie
+    // session : p99 des ecarts d'ecriture = 35 s, d'ou le seuil a 90 s.
+    #[test]
+    fn seul_l_agent_recemment_actif_est_compte() {
+        let dir = std::env::temp_dir().join("statusline-agents-vivacite");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ecrire_agent(&dir, "agent-vivant", "sonnet", "claude-sonnet-5", 5);
+        ecrire_agent(&dir, "agent-fini", "opus", "claude-opus-5", AGENT_MAX_AGE_SECS + 60);
+        let mut got = scan_live_agents(&dir, AGENT_MAX_AGE_SECS);
+        let _ = std::fs::remove_dir_all(&dir);
+        got.sort();
+        assert_eq!(got, vec!["Sonnet 5".to_string()]);
+    }
+
+    #[test]
+    fn dossier_sous_agents_absent_ne_produit_rien() {
+        let dir = std::env::temp_dir().join("statusline-agents-inexistant");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(scan_live_agents(&dir, AGENT_MAX_AGE_SECS).is_empty());
+    }
+
+    // Un .meta.json orphelin (transcript pas encore ecrit) n'est pas un agent
+    // vivant : sans transcript, aucune preuve d'activite.
+    #[test]
+    fn meta_sans_transcript_est_ignore() {
+        let dir = std::env::temp_dir().join("statusline-agents-orphelin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-x.meta.json"), r#"{"model":"sonnet"}"#).unwrap();
+        let got = scan_live_agents(&dir, AGENT_MAX_AGE_SECS);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.is_empty());
+    }
+
+    // ---- Vivacite : l'horodatage interne prime sur le mtime ----
+
+    use super::last_activity_secs;
+
+    // Le mtime est bousculable par n'importe quoi (sauvegarde, antivirus, sync,
+    // git). Constate en test end-to-end : un `touch` a suffi a faire passer pour
+    // vivant un agent dont la derniere entree datait de 38 minutes. La queue
+    // qu'on lit deja pour le modele porte l'horodatage REEL de la derniere
+    // ecriture de l'agent : c'est lui qui fait foi.
+    #[test]
+    fn derniere_activite_lue_dans_la_queue() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        let tail = r#"{"timestamp":"2026-09-04T11:59:30.000Z","type":"assistant"}"#;
+        assert_eq!(last_activity_secs(tail, now), Some(30));
+    }
+
+    // Journal append-only : c'est la DERNIERE occurrence qui date l'activite.
+    #[test]
+    fn derniere_activite_prend_la_derniere_occurrence() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        let tail = r#"{"timestamp":"2026-09-04T10:00:00.000Z"} {"timestamp":"2026-09-04T11:59:00.000Z"}"#;
+        assert_eq!(last_activity_secs(tail, now), Some(60));
+    }
+
+    // Queue tronquee au milieu d'un gros resultat d'outil : aucun horodatage
+    // exploitable. On ne peut alors ni prouver ni infirmer l'activite -- on
+    // retombe sur le mtime, deja filtre en amont, plutot que d'ecarter un agent
+    // peut-etre vivant.
+    #[test]
+    fn derniere_activite_absente_donne_none() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        assert_eq!(last_activity_secs("{\"type\":\"user\"}", now), None);
+    }
+
+    #[test]
+    fn derniere_activite_ignore_un_horodatage_illisible() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        assert_eq!(last_activity_secs(r#"{"timestamp":"pas-une-date"}"#, now), None);
+    }
+
+    // Le scenario exact du faux positif observe : mtime rajeuni par un tiers,
+    // contenu inchange depuis longtemps. L'agent ne doit PAS etre compte.
+    #[test]
+    fn mtime_frais_mais_contenu_ancien_n_est_pas_vivant() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join("statusline-agents-mtime-menteur");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-x.meta.json"), r#"{"model":"sonnet"}"#).unwrap();
+        let jl = dir.join("agent-x.jsonl");
+        let vieux = Utc::now() - chrono::Duration::seconds(AGENT_MAX_AGE_SECS as i64 + 600);
+        std::fs::write(
+            &jl,
+            format!(
+                r#"{{"timestamp":"{}","message":{{"model":"claude-sonnet-5"}}}}"#,
+                vieux.to_rfc3339()
+            ),
+        )
+        .unwrap();
+        // mtime rajeuni artificiellement, comme le ferait une sauvegarde.
+        let f = std::fs::OpenOptions::new().write(true).open(&jl).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(2)).unwrap();
+        drop(f);
+
+        let got = scan_live_agents(&dir, AGENT_MAX_AGE_SECS);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            got.is_empty(),
+            "un mtime rajeuni ne doit pas suffire a declarer l'agent vivant (obtenu {got:?})"
+        );
+    }
+
+    // Contenu recent : compte, evidemment. Verifie que le durcissement
+    // ci-dessus n'a pas rendu la detection inoperante.
+    #[test]
+    fn contenu_recent_est_bien_vivant() {
+        let dir = std::env::temp_dir().join("statusline-agents-contenu-frais");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-y.meta.json"), r#"{"model":"haiku"}"#).unwrap();
+        std::fs::write(
+            dir.join("agent-y.jsonl"),
+            format!(
+                r#"{{"timestamp":"{}","message":{{"model":"claude-haiku-4-5-20251001"}}}}"#,
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+        let got = scan_live_agents(&dir, AGENT_MAX_AGE_SECS);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, vec!["Haiku 4.5".to_string()]);
     }
 }
