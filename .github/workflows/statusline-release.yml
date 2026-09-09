@@ -1,0 +1,38 @@
+name: statusline-release
+
+# Rebuild the statusline.exe (Rust) on every change and publish it as the
+# single asset of a rolling GitHub Release tagged "statusline". This gives
+# claude-code/statusline-rs/install.ps1 a stable download URL that always
+# points at the latest build, without needing a Rust toolchain on the
+# machine running the one-liner.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'claude-code/statusline-rs/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        working-directory: claude-code/statusline-rs
+        run: cargo build --release
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release delete statusline --yes --cleanup-tag 2>$null
+          gh release create statusline `
+            claude-code/statusline-rs/target/release/statusline.exe `
+            --title "statusline (rolling)" `
+            --notes "Auto-built from ${{ github.sha }}"
